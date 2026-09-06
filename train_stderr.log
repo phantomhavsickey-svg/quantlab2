@@ -1,0 +1,70 @@
+[32m2026-08-15 05:16:25[0m | [1mINFO    [0m | [1mCUDA 可用: NVIDIA GeForce RTX 4060 Laptop GPU (8.0 GB)，使用 GPU 训练[0m
+[32m2026-08-15 05:16:25[0m | [1mINFO    [0m | [1m加载因子面板: D:/quantlab/data/cache/factor_panel.parquet[0m
+[32m2026-08-15 05:16:25[0m | [1mINFO    [0m | [1m因子面板: 1,256,428 行 × 25 个因子, 999 只股票, 2021-01-04 → 2026-08-14[0m
+[32m2026-08-15 05:16:29[0m | [1mINFO    [0m | [1m加载日线: 999 只股票[0m
+[32m2026-08-15 05:16:29[0m | [1mINFO    [0m | [1m构建序列存储: seq_len=20, horizon=20, 因子数=25[0m
+[32m2026-08-15 05:16:30[0m | [1mINFO    [0m | [1mper-symbol 矩阵构建完成: 999 只股票, 共 1,256,428 行, 1361 个交易日[0m
+[32m2026-08-15 05:16:32[0m | [1mINFO    [0m | [1m标签构建完成: 1,236,448 条有效前向收益标签(缩尾 [1%, 99%])[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:32[0m | [1mINFO    [0m | [1m模型参数量: 558,721[0m
+[32m2026-08-15 05:16:33[0m | [1mINFO    [0m | [1mWalk-Forward 划分: 8 折 (2023-01-04 → 2027-01-07)[0m
+[32m2026-08-15 05:16:33[0m | [1mINFO    [0m | [1m全量样本: 1,217,467 | Walk-Forward 8 折, batch=1024[0m
+[32m2026-08-15 05:16:33[0m | [1mINFO    [0m | [1m===== Fold 1/8: OOS [2023-01-04, 2023-07-04) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:33[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_1\best.pt (epoch=59, best_IC=0.9322)[0m
+推理:   0%|          | 0/106 [00:00<?, ?it/s]推理:   1%|          | 1/106 [00:00<00:12,  8.54it/s]推理:   2%|▏         | 2/106 [00:00<00:12,  8.16it/s]推理:   6%|▌         | 6/106 [00:00<00:04, 20.46it/s]推理:  12%|█▏        | 13/106 [00:00<00:02, 37.89it/s]推理:  20%|█▉        | 21/106 [00:00<00:01, 50.60it/s]推理:  27%|██▋       | 29/106 [00:00<00:01, 59.53it/s]推理:  35%|███▍      | 37/106 [00:00<00:01, 64.94it/s]推理:  43%|████▎     | 46/106 [00:00<00:00, 69.39it/s]推理:  52%|█████▏    | 55/106 [00:00<00:00, 72.36it/s]推理:  60%|██████    | 64/106 [00:01<00:00, 74.27it/s]推理:  68%|██████▊   | 72/106 [00:01<00:00, 64.26it/s]推理:  75%|███████▌  | 80/106 [00:01<00:00, 67.99it/s]推理:  83%|████████▎ | 88/106 [00:01<00:00, 69.43it/s]推理:  92%|█████████▏| 97/106 [00:01<00:00, 73.58it/s]推理:  99%|█████████▉| 105/106 [00:01<00:00, 73.39it/s]                                                       [32m2026-08-15 05:16:36[0m | [1mINFO    [0m | [1mFold 1 完成: train_end=2023-01-03 | best_IC=0.9322 | OOS_IC=0.0680 | OOS_RMSE=0.14637[0m
+[32m2026-08-15 05:16:36[0m | [1mINFO    [0m | [1m===== Fold 2/8: OOS [2023-07-04, 2024-01-04) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:36[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_2\best.pt (epoch=60, best_IC=0.9518)[0m
+推理:   0%|          | 0/116 [00:00<?, ?it/s]推理:   1%|          | 1/116 [00:00<00:11,  9.76it/s]推理:   8%|▊         | 9/116 [00:00<00:02, 47.96it/s]推理:  15%|█▍        | 17/116 [00:00<00:01, 61.89it/s]推理:  22%|██▏       | 25/116 [00:00<00:01, 67.08it/s]推理:  28%|██▊       | 33/116 [00:00<00:01, 71.21it/s]推理:  35%|███▌      | 41/116 [00:00<00:01, 72.75it/s]推理:  42%|████▏     | 49/116 [00:00<00:00, 74.41it/s]推理:  49%|████▉     | 57/116 [00:00<00:00, 74.58it/s]推理:  56%|█████▌    | 65/116 [00:00<00:00, 75.46it/s]推理:  63%|██████▎   | 73/116 [00:01<00:00, 76.03it/s]推理:  70%|██████▉   | 81/116 [00:01<00:00, 76.58it/s]推理:  78%|███████▊  | 90/116 [00:01<00:00, 78.35it/s]推理:  85%|████████▌ | 99/116 [00:01<00:00, 79.03it/s]推理:  92%|█████████▏| 107/116 [00:01<00:00, 76.57it/s]推理: 100%|██████████| 116/116 [00:01<00:00, 78.62it/s]                                                       [32m2026-08-15 05:16:37[0m | [1mINFO    [0m | [1mFold 2 完成: train_end=2023-07-03 | best_IC=0.9518 | OOS_IC=0.0738 | OOS_RMSE=0.13230[0m
+[32m2026-08-15 05:16:37[0m | [1mINFO    [0m | [1m===== Fold 3/8: OOS [2024-01-04, 2024-07-04) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:38[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_3\best.pt (epoch=60, best_IC=0.9334)[0m
+推理:   0%|          | 0/111 [00:00<?, ?it/s]推理:   7%|▋         | 8/111 [00:00<00:01, 76.86it/s]推理:  15%|█▌        | 17/111 [00:00<00:01, 78.80it/s]推理:  23%|██▎       | 25/111 [00:00<00:01, 76.76it/s]推理:  30%|██▉       | 33/111 [00:00<00:01, 76.96it/s]推理:  38%|███▊      | 42/111 [00:00<00:00, 79.22it/s]推理:  45%|████▌     | 50/111 [00:00<00:00, 61.84it/s]推理:  53%|█████▎    | 59/111 [00:00<00:00, 67.23it/s]推理:  61%|██████▏   | 68/111 [00:00<00:00, 71.11it/s]推理:  69%|██████▉   | 77/111 [00:01<00:00, 73.16it/s]推理:  77%|███████▋  | 85/111 [00:01<00:00, 73.27it/s]推理:  84%|████████▍ | 93/111 [00:01<00:00, 73.68it/s]推理:  92%|█████████▏| 102/111 [00:01<00:00, 75.03it/s]推理:  99%|█████████▉| 110/111 [00:01<00:00, 76.10it/s]                                                       [32m2026-08-15 05:16:39[0m | [1mINFO    [0m | [1mFold 3 完成: train_end=2024-01-03 | best_IC=0.9334 | OOS_IC=0.0538 | OOS_RMSE=0.14914[0m
+[32m2026-08-15 05:16:39[0m | [1mINFO    [0m | [1m===== Fold 4/8: OOS [2024-07-04, 2025-01-04) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:39[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_4\best.pt (epoch=60, best_IC=0.9281)[0m
+推理:   0%|          | 0/117 [00:00<?, ?it/s]推理:   8%|▊         | 9/117 [00:00<00:01, 78.25it/s]推理:  15%|█▌        | 18/117 [00:00<00:01, 78.04it/s]推理:  23%|██▎       | 27/117 [00:00<00:01, 79.99it/s]推理:  31%|███       | 36/117 [00:00<00:01, 80.85it/s]推理:  38%|███▊      | 45/117 [00:00<00:01, 62.88it/s]推理:  46%|████▌     | 54/117 [00:00<00:00, 67.36it/s]推理:  53%|█████▎    | 62/117 [00:00<00:00, 69.07it/s]推理:  61%|██████    | 71/117 [00:00<00:00, 71.45it/s]推理:  68%|██████▊   | 79/117 [00:01<00:00, 73.35it/s]推理:  75%|███████▌  | 88/117 [00:01<00:00, 75.09it/s]推理:  83%|████████▎ | 97/117 [00:01<00:00, 76.96it/s]推理:  91%|█████████ | 106/117 [00:01<00:00, 78.24it/s]推理:  97%|█████████▋| 114/117 [00:01<00:00, 78.71it/s]                                                       [32m2026-08-15 05:16:41[0m | [1mINFO    [0m | [1mFold 4 完成: train_end=2024-07-03 | best_IC=0.9281 | OOS_IC=0.0482 | OOS_RMSE=0.19849[0m
+[32m2026-08-15 05:16:41[0m | [1mINFO    [0m | [1m===== Fold 5/8: OOS [2025-01-06, 2025-07-06) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:41[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_5\best.pt (epoch=60, best_IC=0.9179)[0m
+推理:   0%|          | 0/114 [00:00<?, ?it/s]推理:   7%|▋         | 8/114 [00:00<00:01, 72.76it/s]推理:  14%|█▍        | 16/114 [00:00<00:01, 74.95it/s]推理:  21%|██        | 24/114 [00:00<00:01, 75.94it/s]推理:  28%|██▊       | 32/114 [00:00<00:01, 75.93it/s]推理:  35%|███▌      | 40/114 [00:00<00:00, 76.56it/s]推理:  42%|████▏     | 48/114 [00:00<00:00, 76.64it/s]推理:  49%|████▉     | 56/114 [00:00<00:00, 77.23it/s]推理:  57%|█████▋    | 65/114 [00:00<00:00, 77.43it/s]推理:  65%|██████▍   | 74/114 [00:00<00:00, 78.30it/s]推理:  73%|███████▎  | 83/114 [00:01<00:00, 78.63it/s]推理:  80%|███████▉  | 91/114 [00:01<00:00, 78.31it/s]推理:  87%|████████▋ | 99/114 [00:01<00:00, 76.86it/s]推理:  95%|█████████▍| 108/114 [00:01<00:00, 76.67it/s]                                                       [32m2026-08-15 05:16:43[0m | [1mINFO    [0m | [1mFold 5 完成: train_end=2025-01-03 | best_IC=0.9179 | OOS_IC=0.0643 | OOS_RMSE=0.15879[0m
+[32m2026-08-15 05:16:43[0m | [1mINFO    [0m | [1m===== Fold 6/8: OOS [2025-07-07, 2026-01-07) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:43[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_6\best.pt (epoch=60, best_IC=0.9021)[0m
+推理:   0%|          | 0/121 [00:00<?, ?it/s]推理:   2%|▏         | 2/121 [00:00<00:06, 18.70it/s]推理:   8%|▊         | 10/121 [00:00<00:02, 53.07it/s]推理:  16%|█▌        | 19/121 [00:00<00:01, 67.46it/s]推理:  22%|██▏       | 27/121 [00:00<00:01, 67.37it/s]推理:  30%|██▉       | 36/121 [00:00<00:01, 73.23it/s]推理:  37%|███▋      | 45/121 [00:00<00:01, 73.43it/s]推理:  45%|████▍     | 54/121 [00:00<00:00, 77.20it/s]推理:  51%|█████     | 62/121 [00:00<00:00, 77.46it/s]推理:  58%|█████▊    | 70/121 [00:00<00:00, 77.69it/s]推理:  64%|██████▍   | 78/121 [00:01<00:00, 63.12it/s]推理:  71%|███████   | 86/121 [00:01<00:00, 66.72it/s]推理:  79%|███████▊  | 95/121 [00:01<00:00, 70.98it/s]推理:  86%|████████▌ | 104/121 [00:01<00:00, 70.84it/s]推理:  93%|█████████▎| 113/121 [00:01<00:00, 73.32it/s]                                                       [32m2026-08-15 05:16:45[0m | [1mINFO    [0m | [1mFold 6 完成: train_end=2025-07-04 | best_IC=0.9021 | OOS_IC=0.0315 | OOS_RMSE=0.16468[0m
+[32m2026-08-15 05:16:45[0m | [1mINFO    [0m | [1m===== Fold 7/8: OOS [2026-01-07, 2026-07-07) =====[0m
+C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\nn\modules\transformer.py:379: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+[32m2026-08-15 05:16:45[0m | [1mINFO    [0m | [1mcheckpoint 已加载: models/saved\fold_7\best.pt (epoch=38, best_IC=0.8879)[0m
+推理:   0%|          | 0/115 [00:00<?, ?it/s]推理:   7%|▋         | 8/115 [00:00<00:01, 74.15it/s]推理:  14%|█▍        | 16/115 [00:00<00:01, 75.68it/s]推理:  21%|██        | 24/115 [00:00<00:01, 76.97it/s]推理:  29%|██▊       | 33/115 [00:00<00:01, 79.28it/s]推理:  36%|███▌      | 41/115 [00:00<00:00, 78.37it/s]推理:  43%|████▎     | 49/115 [00:00<00:00, 76.63it/s]推理:  50%|████▉     | 57/115 [00:00<00:00, 62.85it/s]推理:  57%|█████▋    | 66/115 [00:00<00:00, 67.24it/s]推理:  64%|██████▍   | 74/115 [00:01<00:00, 70.15it/s]推理:  71%|███████▏  | 82/115 [00:01<00:00, 71.67it/s]推理:  78%|███████▊  | 90/115 [00:01<00:00, 72.47it/s]推理:  85%|████████▌ | 98/115 [00:01<00:00, 73.45it/s]推理:  92%|█████████▏| 106/115 [00:01<00:00, 73.69it/s]推理:  99%|█████████▉| 114/115 [00:01<00:00, 74.58it/s]                                                       [32m2026-08-15 05:16:47[0m | [1mINFO    [0m | [1mFold 7 完成: train_end=2026-01-06 | best_IC=0.8879 | OOS_IC=0.0517 | OOS_RMSE=0.19041[0m
+[32m2026-08-15 05:16:47[0m | [1mINFO    [0m | [1m===== Fold 8/8: OOS [2026-07-07, 2027-01-07) =====[0m
+Epoch 1 [train]:   0%|          | 0/1181 [00:00<?, ?it/s]                                                         Traceback (most recent call last):
+  File "D:\quantlab2\main.py", line 476, in <module>
+    main()
+  File "D:\quantlab2\main.py", line 464, in main
+    cmd_train(args)
+  File "D:\quantlab2\main.py", line 73, in cmd_train
+    folds, oos_df = trainer.walk_forward_train(
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\quantlab2\models\trainer.py", line 632, in walk_forward_train
+    fold_metrics, oos_df = self._run_fold(
+                           ^^^^^^^^^^^^^^^
+  File "D:\quantlab2\models\trainer.py", line 491, in _run_fold
+    result = self.fit(train_loader, valid_loader,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\quantlab2\models\trainer.py", line 326, in fit
+    train_loss = self.train_one_epoch(train_loader, epoch)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\quantlab2\models\trainer.py", line 240, in train_one_epoch
+    self.scaler.step(self.optimizer)
+  File "C:\Users\blessing\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\amp\grad_scaler.py", line 454, in step
+    len(optimizer_state["found_inf_per_device"]) > 0
+AssertionError: No inf checks were recorded for this optimizer.

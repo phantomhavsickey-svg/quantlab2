@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型 checkpoint
+models/saved/
+
+# 缓存与输出
+data/cache/
+logs/
+reports/
+signals/

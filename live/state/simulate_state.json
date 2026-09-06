@@ -1,0 +1,343 @@
+{
+  "cash": 80597.99289999998,
+  "initial_cash": 1000000.0,
+  "trade_date": "2026-09-01",
+  "positions": {
+    "000506": {
+      "shares": 1000,
+      "available_shares": 1000,
+      "locked_shares": 0,
+      "avg_cost": 21.04,
+      "market_price": 20.99
+    },
+    "000603": {
+      "shares": 500,
+      "available_shares": 500,
+      "locked_shares": 0,
+      "avg_cost": 37.03,
+      "market_price": 37.0
+    },
+    "001337": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 55.1,
+      "market_price": 54.61
+    },
+    "002237": {
+      "shares": 1400,
+      "available_shares": 1400,
+      "locked_shares": 0,
+      "avg_cost": 15.394285714285715,
+      "market_price": 15.21
+    },
+    "002290": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 64.15,
+      "market_price": 63.52
+    },
+    "002378": {
+      "shares": 800,
+      "available_shares": 800,
+      "locked_shares": 0,
+      "avg_cost": 24.43,
+      "market_price": 23.7
+    },
+    "002400": {
+      "shares": 3200,
+      "available_shares": 3200,
+      "locked_shares": 0,
+      "avg_cost": 6.6884375,
+      "market_price": 6.61
+    },
+    "002488": {
+      "shares": 2600,
+      "available_shares": 2600,
+      "locked_shares": 0,
+      "avg_cost": 8.354615384615386,
+      "market_price": 8.33
+    },
+    "002498": {
+      "shares": 3300,
+      "available_shares": 3300,
+      "locked_shares": 0,
+      "avg_cost": 6.680909090909091,
+      "market_price": 6.87
+    },
+    "002545": {
+      "shares": 1200,
+      "available_shares": 1200,
+      "locked_shares": 0,
+      "avg_cost": 17.753333333333334,
+      "market_price": 17.52
+    },
+    "002636": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 70.5,
+      "market_price": 68.57
+    },
+    "002716": {
+      "shares": 1900,
+      "available_shares": 1900,
+      "locked_shares": 0,
+      "avg_cost": 11.66,
+      "market_price": 11.22
+    },
+    "300102": {
+      "shares": 1200,
+      "available_shares": 1200,
+      "locked_shares": 0,
+      "avg_cost": 17.929166666666667,
+      "market_price": 17.76
+    },
+    "300170": {
+      "shares": 1300,
+      "available_shares": 1300,
+      "locked_shares": 0,
+      "avg_cost": 16.852307692307694,
+      "market_price": 16.46
+    },
+    "300244": {
+      "shares": 1200,
+      "available_shares": 1200,
+      "locked_shares": 0,
+      "avg_cost": 17.858333333333334,
+      "market_price": 17.72
+    },
+    "300342": {
+      "shares": 600,
+      "available_shares": 600,
+      "locked_shares": 0,
+      "avg_cost": 32.75,
+      "market_price": 32.4
+    },
+    "300503": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 67.77,
+      "market_price": 66.7
+    },
+    "300776": {
+      "shares": 100,
+      "available_shares": 100,
+      "locked_shares": 0,
+      "avg_cost": 111.95,
+      "market_price": 110.09
+    },
+    "300806": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 48.2,
+      "market_price": 47.36
+    },
+    "301005": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 67.25,
+      "market_price": 65.49
+    },
+    "301225": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 58.3,
+      "market_price": 57.39
+    },
+    "301293": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 52.6,
+      "market_price": 51.91
+    },
+    "301363": {
+      "shares": 1300,
+      "available_shares": 1300,
+      "locked_shares": 0,
+      "avg_cost": 16.16,
+      "market_price": 16.03
+    },
+    "301550": {
+      "shares": 200,
+      "available_shares": 200,
+      "locked_shares": 0,
+      "avg_cost": 90.5,
+      "market_price": 89.4
+    },
+    "301662": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 65.15,
+      "market_price": 62.7
+    },
+    "600259": {
+      "shares": 200,
+      "available_shares": 200,
+      "locked_shares": 0,
+      "avg_cost": 79.92,
+      "market_price": 76.99
+    },
+    "600301": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 45.88,
+      "market_price": 44.97
+    },
+    "600391": {
+      "shares": 500,
+      "available_shares": 500,
+      "locked_shares": 0,
+      "avg_cost": 36.34,
+      "market_price": 36.4
+    },
+    "600531": {
+      "shares": 1600,
+      "available_shares": 1600,
+      "locked_shares": 0,
+      "avg_cost": 13.65,
+      "market_price": 13.08
+    },
+    "600869": {
+      "shares": 1000,
+      "available_shares": 1000,
+      "locked_shares": 0,
+      "avg_cost": 21.05,
+      "market_price": 21.2
+    },
+    "600877": {
+      "shares": 1700,
+      "available_shares": 1700,
+      "locked_shares": 0,
+      "avg_cost": 12.08,
+      "market_price": 12.02
+    },
+    "600986": {
+      "shares": 2900,
+      "available_shares": 2900,
+      "locked_shares": 0,
+      "avg_cost": 7.44,
+      "market_price": 7.56
+    },
+    "601069": {
+      "shares": 600,
+      "available_shares": 600,
+      "locked_shares": 0,
+      "avg_cost": 30.9,
+      "market_price": 30.0
+    },
+    "603057": {
+      "shares": 1000,
+      "available_shares": 1000,
+      "locked_shares": 0,
+      "avg_cost": 19.76,
+      "market_price": 20.69
+    },
+    "603171": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 45.72,
+      "market_price": 44.82
+    },
+    "603619": {
+      "shares": 900,
+      "available_shares": 900,
+      "locked_shares": 0,
+      "avg_cost": 22.42,
+      "market_price": 22.78
+    },
+    "603667": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 51.72,
+      "market_price": 48.85
+    },
+    "603929": {
+      "shares": 100,
+      "available_shares": 100,
+      "locked_shares": 0,
+      "avg_cost": 156.2,
+      "market_price": 150.26
+    },
+    "605116": {
+      "shares": 1100,
+      "available_shares": 1100,
+      "locked_shares": 0,
+      "avg_cost": 19.8,
+      "market_price": 19.64
+    },
+    "688003": {
+      "shares": 200,
+      "available_shares": 200,
+      "locked_shares": 0,
+      "avg_cost": 78.2,
+      "market_price": 75.01
+    },
+    "688031": {
+      "shares": 100,
+      "available_shares": 100,
+      "locked_shares": 0,
+      "avg_cost": 113.22,
+      "market_price": 105.88
+    },
+    "688362": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 62.67,
+      "market_price": 58.6
+    },
+    "688390": {
+      "shares": 300,
+      "available_shares": 300,
+      "locked_shares": 0,
+      "avg_cost": 62.5,
+      "market_price": 61.22
+    },
+    "688516": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 42.6,
+      "market_price": 41.08
+    },
+    "688523": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 41.08,
+      "market_price": 41.03
+    },
+    "688548": {
+      "shares": 600,
+      "available_shares": 600,
+      "locked_shares": 0,
+      "avg_cost": 30.18,
+      "market_price": 28.77
+    },
+    "688717": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 45.85,
+      "market_price": 45.5
+    },
+    "688726": {
+      "shares": 400,
+      "available_shares": 400,
+      "locked_shares": 0,
+      "avg_cost": 44.29,
+      "market_price": 43.53
+    }
+  }
+}

@@ -1,0 +1,57 @@
+# ============================================================
+# QuantLab2 - Transformer stock selection model (A-shares)
+#
+# IMPORTANT - install torch separately FIRST:
+#   1) pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#   2) pip install -r requirements.txt
+#
+# Why cu121:
+#   - This machine's NVIDIA driver is 537.53, which supports CUDA runtime
+#     up to 12.1 -> must use cu121 wheels.
+#   - torch 2.5.1 is the last release with cu121 wheels (2.6+ ships only
+#     cu118/cu124/cu126).
+#   - cu124 requires driver >= 551.61. After upgrading the driver:
+#       pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   - Verify:
+#       python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# If download.pytorch.org is too slow (e.g. from China), download the
+# wheel directly from the SJTU mirror (resumable with curl -C -):
+#   curl -L -C - -o torch-2.5.1+cu121.whl ^
+#     "https://mirror.sjtu.edu.cn/pytorch-wheels/cu121/torch-2.5.1%2Bcu121-cp311-cp311-win_amd64.whl"
+#   pip install torch-2.5.1+cu121.whl --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+# (mirrors.aliyun.com/pytorch-wheels/cu121 does NOT host this wheel)
+# ============================================================
+
+# data processing
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14.0
+
+# evaluation (rank IC uses scipy.spearmanr)
+scipy>=1.11
+scikit-learn>=1.3
+
+# config / logging / progress
+pyyaml>=6.0
+loguru>=0.7
+tqdm>=4.66
+
+# A-share trading calendar (utils/calendar.py ported from quantlab)
+cn-stock-holidays>=2.0
+
+# benchmark index download (optional, falls back gracefully)
+akshare>=1.14.0
+
+# visualization (optional, HTML report)
+plotly>=5.0
+
+# ============================================================
+# OPTIONAL - QMT real-broker trading (live module, China A-shares):
+#   pip install xtquant
+#   Only needed if you use `python main.py live --broker qmt`.
+#   Requires a local miniQMT client (e.g. Guojin QMT) logged in,
+#   plus live.qmt.mini_qmt_path / account_id in config.yaml.
+#   Without it, the qmt backend fails fast with an install hint;
+#   simulate / none backends do NOT need it.
+# ============================================================

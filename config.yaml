@@ -1,0 +1,98 @@
+# ============================================================
+# QuantLab2 配置文件 — Transformer 深度学习选股模型
+# ============================================================
+
+# --- 数据(复用 quantlab 缓存资产,路径可配置) ---
+data:
+  factor_panel: "D:/quantlab/data/cache/factor_panel.parquet"   # 已截面 zscore + lag1 的因子面板
+  daily_dir: "D:/quantlab/data/cache/daily"                      # 中文列名前复权日线
+  prediction_cache: "data/cache/predictions.parquet"             # OOS 预测缓存(回测唯一输入)
+  benchmark_cache: "data/cache/benchmark_000852.parquet"         # 基准指数本地缓存
+  min_valid_label_days: 15                                       # 标签窗口内最少有效交易日(剔除长期停牌)
+
+# --- 模型 ---
+model:
+  type: "regressor"                # regressor(收益率回归) / classifier(涨跌分类)
+  horizon: 20                      # 前向 N 日收益(与 quantlab 一致)
+  seq_len: 20                      # 最近 N 个有因子值的交易日
+  arch:
+    d_model: 128
+    n_heads: 8                     # head_dim = d_model / n_heads = 16
+    n_layers: 4
+    dim_ff: 256
+    dropout: 0.1
+    activation: "gelu"
+    max_seq_len: 64                # 位置嵌入容量,须 ≥ seq_len + 1
+  training:
+    batch_size: 1024
+    epochs: 60                     # 上限;早停是否真的触发看日志 early_stopped 字段
+    lr: 0.001
+    weight_decay: 0.01
+    warmup_steps: 1000
+    lr_min: 0.00001
+    grad_clip: 1.0
+    loss: "mse"                    # mse / huber
+    label_winsor: [0.01, 0.99]     # 标签按日截面缩尾
+    early_stop_patience: 10
+    early_stop_metric: "rank_ic"   # 模型选择指标:rank_ic / loss
+    use_amp: true                  # 仅 cuda 生效,CPU 自动禁用
+    num_workers: 0                 # Windows 下固定 0
+    seed: 42
+  walk_forward:
+    min_train_months: 24           # 首个 OOS 窗口前的最短训练期(月,同 quantlab)
+    retrain_months: 6              # 每 N 个月滚动重训(同 quantlab)
+    # 折内三段:train [.., val_start) | valid [val_start, purge_start) | OOS [ws, we)
+    # train 与 valid 无交集;purge_start = ws 往前 (horizon + embargo_days) 个交易日
+    val_months: 3                  # 从训练尾部切出做模型选择(不再与训练重叠)
+    embargo_days: 0                # purge 缺口之外再多的安全交易日,建议 5
+    min_oos_days: 20               # OOS 交易日不足此值的尾部折直接丢弃
+    daily_ic_csv: "reports/daily_ic.csv"   # 逐日 OOS IC(~20 KB,显著性凭据)
+  save_dir: "models/saved"
+
+# --- 市场/成本(与 quantlab 完全一致,保证对比公平) ---
+market:
+  stamp_tax_rate: 0.0005      # 印花税 0.05%(仅卖出)
+  commission_rate: 0.0003     # 佣金 0.03%(万三)
+  min_commission: 5.0         # 最低佣金(元)
+  slippage_rate: 0.001        # 滑点 0.1%
+  lot_size: 100               # 一手 = 100 股
+  t_plus_1: true              # T+1 交收(模拟盘撮合使用)
+
+# --- 回测(与 quantlab 完全一致) ---
+backtest:
+  initial_capital: 1000000    # 初始资金 100万
+  rebalance_frequency: "monthly"  # daily / weekly / monthly
+  max_positions: 50           # 最大持仓数
+  position_sizing: "equal_weight"  # equal_weight / signal_strength
+  benchmark: "000852"         # 基准指数(中证1000)
+
+# --- 预测(实盘信号生成) ---
+predict:
+  top_k: 50
+  position_sizing: "equal_weight"
+  output_dir: "signals"
+
+# --- 实时交易 ---
+live:
+  broker: "simulate"           # simulate(模拟盘)/ qmt(miniQMT实盘)/ none(仅指令文件)
+  state_dir: "live/state"      # 模拟盘持仓状态持久化目录
+  order_dir: "live/output"     # 指令/日志输出目录
+  rebalance_time: "09:35"      # 盘中调仓时间(HH:MM)
+  poll_interval: 5             # 行情轮询间隔(秒)
+  rebalance_day: "month_end"   # 调仓日: month_end(月末交易日)/ daily / weekly
+  risk:
+    max_position_pct: 0.20     # 单股最大仓位(预估成交后)
+    max_total_pct: 0.95        # 总仓位上限(现金留底)
+    max_positions: 50          # 最大持仓数
+    block: true                # true=风控阻断(跳过违规订单); false=仅告警
+  qmt:
+    mini_qmt_path: ""          # miniQMT 用户数据目录,如 D:\国金QMT\userdata_mini
+    account_id: ""             # 资金账号
+    # 注: qmt 模式必须显式加 --confirm 才会真实下单,默认仅导出指令文件
+
+# --- 日志 ---
+logging:
+  level: "INFO"
+  file: "logs/quantlab2.log"
+  rotation: "10 MB"
+  retention: "30 days"

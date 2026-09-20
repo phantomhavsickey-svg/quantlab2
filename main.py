@@ -39,12 +39,17 @@ def load_config(path: str = "config.yaml") -> dict:
 # ==================== 公共:数据加载 ====================
 
 def build_store(config: dict, panel: pd.DataFrame):
-    """从因子面板 + 日线构建 SequenceStore。"""
-    from data.loader import load_daily_dict
+    """从因子面板 + 日线构建 SequenceStore。
+
+    日线只需要 日期/收盘 两列(算前向收益标签用),parquet 是列存,
+    裁剪列能砍掉绝大部分解析量 —— 999 个文件逐个读时这个差别是分钟级。
+    """
+    from data.loader import load_daily_dict, DATE_COL, CLOSE_COL
     from models.sequence_data import SequenceStore
 
     symbols = sorted(panel["symbol"].unique())
-    daily = load_daily_dict(config["data"]["daily_dir"], symbols)
+    daily = load_daily_dict(config["data"]["daily_dir"], symbols,
+                            columns=[DATE_COL, CLOSE_COL])
     store = SequenceStore(panel, daily, config)
     return store, daily
 
@@ -360,7 +365,7 @@ def cmd_smoke(args):
     device = get_device()
 
     from data.loader import load_factor_panel
-    from models.sequence_data import SequenceStore, make_loaders, \
+    from models.sequence_data import SequenceStore, make_loader, \
         walk_forward_windows
     from models.transformer import build_model, count_parameters
     from models.trainer import TransformerTrainer, compute_rank_ic
@@ -391,11 +396,13 @@ def cmd_smoke(args):
     store = SequenceStore(panel, daily, config)
 
     # 泄漏断言
-    idx, dates = store.sample_index()
-    assert len(idx) > 5000, f"样本太少: {len(idx)}"
+    samples = store.sample_index()
+    dates = samples.dates
+    assert len(samples) > 5000, f"样本太少: {len(samples)}"
+    assert np.isfinite(samples.labels(store)).all(), "训练样本标签含 NaN"
     rng = np.random.default_rng(42)
-    for i in rng.choice(len(idx), 50, replace=False):
-        si, t = idx[i]
+    for i in rng.choice(len(samples), 50, replace=False):
+        si, t = samples[i]
         sym = store.symbols[si]
         win_dates = store.dates_by_symbol[sym][t - store.seq_len + 1: t + 1]
         assert win_dates[-1] == store.dates_by_symbol[sym][t]
@@ -415,18 +422,17 @@ def cmd_smoke(args):
     smoke_cfg["model"]["training"].update({"batch_size": 256, "epochs": 2})
     store.seq_len = 10
 
-    idx, dates = store.sample_index()
+    samples = store.sample_index()
+    dates = samples.dates
     uniq = np.unique(dates)
     split_date = uniq[int(len(uniq) * 0.8)]
     train_mask = dates <= split_date
-    valid_mask = ~train_mask
+    train = samples.select(train_mask)
+    valid = samples.select(~train_mask)
 
-    train_idx = [idx[i] for i in np.nonzero(train_mask)[0]]
-    valid_idx = [idx[i] for i in np.nonzero(valid_mask)[0]]
-    train_loader, _ = make_loaders(store, train_idx, dates[train_mask],
-                                   batch_size=256, shuffle=True, seed=42)
-    valid_loader, _ = make_loaders(store, valid_idx, dates[valid_mask],
-                                   batch_size=256, shuffle=False)
+    train_loader = make_loader(store, train, batch_size=256, shuffle=True,
+                               seed=42)
+    valid_loader = make_loader(store, valid, batch_size=256, shuffle=False)
 
     model = build_model(smoke_cfg["model"], n_features=store.n_features)
     logger.info(f"smoke 模型参数量: {count_parameters(model):,}")
@@ -440,11 +446,10 @@ def cmd_smoke(args):
 
     # ===== 3. 过拟合测试 =====
     logger.info("[smoke 3/6] 过拟合测试(64 样本) ...")
-    pos = rng.choice(len(idx), 64, replace=False)
-    tiny_idx = [idx[i] for i in pos]
-    tiny_dates = dates[pos]
-    tiny_loader, _ = make_loaders(store, tiny_idx, tiny_dates,
-                                  batch_size=64, shuffle=True, seed=42)
+    pos = rng.choice(len(samples), 64, replace=False)
+    tiny = samples.select(pos)
+    tiny_loader = make_loader(store, tiny, batch_size=64, shuffle=True,
+                              seed=42)
 
     ov_cfg = copy.deepcopy(smoke_cfg)
     # 64 样本的过拟合测试:关 dropout、恒定较大 lr(cosine 衰减会拖慢
@@ -467,7 +472,7 @@ def cmd_smoke(args):
     from models.trainer import TransformerTrainer as TT
     ckpt_path = ov_res["path"]
     m2, meta2 = TT.load_checkpoint(ckpt_path, device)
-    x = torch.from_numpy(store.get_window(*tiny_idx[0])).unsqueeze(0) \
+    x = torch.from_numpy(store.get_window(*tiny[0])).unsqueeze(0) \
         .to(device)
     with torch.no_grad():
         y1 = ov_trainer.model(x)
@@ -483,8 +488,7 @@ def cmd_smoke(args):
     pred_series = pd.Series(
         valid_pred,
         index=pd.MultiIndex.from_arrays(
-            [dates[valid_mask],
-             [store.symbols[si] for si, _ in valid_idx]],
+            [valid.dates, store.symbols_of(valid)],
             names=["date", "symbol"]),
         name="prediction")
     signals = signals_from_predictions(pred_series, top_k=20,

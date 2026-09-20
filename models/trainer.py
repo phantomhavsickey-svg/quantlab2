@@ -20,7 +20,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from models.transformer import build_model
-from models.sequence_data import SequenceStore, make_loaders, \
+from models.sequence_data import SequenceStore, Samples, make_loader, \
     walk_forward_windows
 
 
@@ -214,6 +214,7 @@ class TransformerTrainer:
         self.factor_names = []
 
         tr = cfg["model"]["training"]
+        self.num_workers = int(tr.get("num_workers", 0))
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=tr["lr"],
             weight_decay=tr["weight_decay"], eps=1e-8)
@@ -482,7 +483,7 @@ class TransformerTrainer:
 
     # ==================== Walk-Forward ====================
 
-    def _predict_oos(self, store: SequenceStore, all_idx: list,
+    def _predict_oos(self, store: SequenceStore, all_samples: Samples,
                      all_dates: np.ndarray, w, batch_size: int
                      ) -> tuple[pd.DataFrame | None, float, float]:
         """对折 OOS 窗口 [ws, we) 做样本外预测(要求模型已加载好权重)。
@@ -493,31 +494,27 @@ class TransformerTrainer:
         ws = np.datetime64(w.ws)
         we = np.datetime64(w.we)
         oos_mask = (all_dates >= ws) & (all_dates < we)
-        oos_idx = [all_idx[i] for i in np.nonzero(oos_mask)[0]]
-        oos_dates = all_dates[oos_mask]
+        oos = all_samples.select(oos_mask)
 
-        if not oos_idx:
+        if len(oos) == 0:
             return None, np.nan, np.nan
 
-        pin = self.device.type == "cuda"
-        oos_loader, oos_labels = make_loaders(
-            store, oos_idx, oos_dates, batch_size=batch_size,
-            shuffle=False, pin_memory=pin)
+        oos_labels = oos.labels(store)
+        oos_loader = make_loader(
+            store, oos, batch_size=batch_size, shuffle=False,
+            pin_memory=self.device.type == "cuda",
+            num_workers=self.num_workers)
         oos_pred = self.predict_loader(oos_loader)
-        ic_res = compute_rank_ic(oos_pred, oos_labels,
-                                 (oos_dates.astype("datetime64[D]")
-                                  .astype(np.int64)))
+        ic_res = compute_rank_ic(oos_pred, oos_labels, oos.date_ints)
         oos_ic = ic_res["mean_ic"]
         oos_rmse = float(np.sqrt(np.mean((oos_pred - oos_labels) ** 2)))
-        symbols = [store.symbols[si] for si, _ in oos_idx]
         oos_df = pd.DataFrame({
-            "date": oos_dates, "symbol": symbols,
+            "date": oos.dates, "symbol": store.symbols_of(oos),
             "prediction": oos_pred, "forward_return": oos_labels,
         })
         return oos_df, oos_ic, oos_rmse
 
-    def _fold_split(self, store: SequenceStore, all_idx: list,
-                    all_dates: np.ndarray, w
+    def _fold_split(self, store: SequenceStore, all_dates: np.ndarray, w
                     ) -> tuple[np.ndarray, np.ndarray, dict]:
         """折内时间切分:train / valid / OOS 三段互不重叠且标签不越界。
 
@@ -561,7 +558,7 @@ class TransformerTrainer:
                 f"{purge / 21:.1f} 个月)")
         return train_mask, valid_mask, info
 
-    def _run_fold(self, store: SequenceStore, all_idx: list,
+    def _run_fold(self, store: SequenceStore, all_samples: Samples,
                   all_dates: np.ndarray, w, batch_size: int,
                   epochs: int, save_dir: str
                   ) -> tuple[dict, pd.DataFrame | None]:
@@ -572,24 +569,26 @@ class TransformerTrainer:
         """
         ws = np.datetime64(w.ws)
         train_mask, valid_mask, split = self._fold_split(
-            store, all_idx, all_dates, w)
+            store, all_dates, w)
 
-        train_idx = [all_idx[i] for i in np.nonzero(train_mask)[0]]
-        valid_idx = [all_idx[i] for i in np.nonzero(valid_mask)[0]]
-        if len(train_idx) == 0:
+        train = all_samples.select(train_mask)
+        valid = all_samples.select(valid_mask)
+        if len(train) == 0:
             raise RuntimeError(f"Fold {w.fold}: 训练样本不足")
-        if set(train_idx) & set(valid_idx):
+        n_overlap = int(np.intersect1d(train.keys, valid.keys,
+                                       assume_unique=True).size)
+        if n_overlap:
             raise RuntimeError(
-                f"Fold {w.fold}: 训练/验证样本重叠 "
-                f"{len(set(train_idx) & set(valid_idx))} 条")
+                f"Fold {w.fold}: 训练/验证样本重叠 {n_overlap} 条")
 
         pin = self.device.type == "cuda"
-        train_loader, _ = make_loaders(
-            store, train_idx, all_dates[train_mask], batch_size=batch_size,
-            shuffle=True, drop_last=True, pin_memory=pin, seed=self.seed)
-        valid_loader, _ = make_loaders(
-            store, valid_idx, all_dates[valid_mask], batch_size=batch_size,
-            shuffle=False, pin_memory=pin)
+        train_loader = make_loader(
+            store, train, batch_size=batch_size, shuffle=True,
+            drop_last=True, pin_memory=pin, seed=self.seed,
+            num_workers=self.num_workers)
+        valid_loader = make_loader(
+            store, valid, batch_size=batch_size, shuffle=False,
+            pin_memory=pin, num_workers=self.num_workers)
 
         fold_dir = os.path.join(save_dir, f"fold_{w.fold}")
         result = self.fit(train_loader, valid_loader,
@@ -598,7 +597,7 @@ class TransformerTrainer:
 
         # --- OOS 预测(样本外) ---
         oos_df, oos_ic, oos_rmse = self._predict_oos(
-            store, all_idx, all_dates, w, batch_size)
+            store, all_samples, all_dates, w, batch_size)
 
         train_dates = all_dates[train_mask]
         oos_mask = (all_dates >= ws) & (all_dates < np.datetime64(w.we))
@@ -611,8 +610,8 @@ class TransformerTrainer:
             "purge_days": split["purge_days"],
             "oos_start": w.ws,
             "oos_end": w.we - pd.Timedelta(days=1),
-            "n_train": len(train_idx),
-            "n_valid": len(valid_idx),
+            "n_train": len(train),
+            "n_valid": len(valid),
             "n_oos": int(oos_mask.sum()),
             "n_oos_days": split["n_oos_days"],
             "best_rank_ic": result["best_rank_ic"],
@@ -670,8 +669,9 @@ class TransformerTrainer:
                                        int(wf_cfg["min_train_months"]),
                                        int(wf_cfg["retrain_months"]),
                                        min_oos_days=min_oos_days)
-        all_idx, all_dates = store.sample_index()
-        logger.info(f"全量样本: {len(all_idx):,} | "
+        all_samples = store.sample_index()
+        all_dates = all_samples.dates
+        logger.info(f"全量样本: {len(all_samples):,} | "
                     f"Walk-Forward {len(windows)} 折, batch={batch_size}")
         logger.info(f"折内切分口径: {split_fp}")
 
@@ -737,7 +737,7 @@ class TransformerTrainer:
                 self.model, meta = self.load_checkpoint(ckpt, self.device)
                 self._reset_optimizer()  # 新模型 → 必须重建优化器
                 oos_df, oos_ic, oos_rmse = self._predict_oos(
-                    store, all_idx, all_dates, w, batch_size)
+                    store, all_samples, all_dates, w, batch_size)
                 train_end = pd.Timestamp(all_dates[all_dates < ws].max())
                 fold_metrics = {
                     "fold": w.fold,
@@ -757,7 +757,7 @@ class TransformerTrainer:
             else:
                 try:
                     fold_metrics, oos_df = self._run_fold(
-                        store, all_idx, all_dates, w, batch_size, epochs,
+                        store, all_samples, all_dates, w, batch_size, epochs,
                         save_dir)
                 except RuntimeError as e:
                     # 跨版本兼容的 OOM 捕获(torch.cuda.OutOfMemoryError /
@@ -768,7 +768,7 @@ class TransformerTrainer:
                         batch_size //= 2
                         logger.warning(f"OOM → batch 减半为 {batch_size} 重试")
                         fold_metrics, oos_df = self._run_fold(
-                            store, all_idx, all_dates, w, batch_size, epochs,
+                            store, all_samples, all_dates, w, batch_size, epochs,
                             save_dir)
                     else:
                         raise

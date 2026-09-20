@@ -3,6 +3,7 @@
 
 内存布局:999 × ~1360 × 25 float32 ≈ 136MB(全样本),绝不预切片成
 (1.2M, seq_len, 25) 大张量(会放大到 2.5GB);__getitem__ 惰性切片。
+样本索引和标签都是列式数组(见 Samples),不用 tuple 列表。
 
 防未来函数规则(冒烟测试逐条断言):
     1. 因子面板已由 quantlab 做 lag 1:日期 t 的因子信息止于 close[t-1]
@@ -25,6 +26,48 @@ from loguru import logger
 from data.loader import DATE_COL, CLOSE_COL
 
 
+class Samples:
+    """(sym_pos, t) 样本索引的列式表示。
+
+    为什么不用 tuple 列表:1.2M 样本的 `[(si, t), ...]` 要 ~134 MB
+    (每个 tuple 112 B 再加列表指针),两个 int32 数组只要 9.6 MB;更要紧的是
+    标签能整段向量化取(省掉 N 次 Python 调用),而且 GPU 侧按索引 gather
+    窗口本来就需要整数张量,不需要 Python tuple。
+    """
+
+    __slots__ = ("sym_pos", "t", "dates")
+
+    def __init__(self, sym_pos, t, dates):
+        self.sym_pos = np.asarray(sym_pos, dtype=np.int32)
+        self.t = np.asarray(t, dtype=np.int32)
+        self.dates = np.asarray(dates, dtype="datetime64[ns]")
+
+    def __len__(self) -> int:
+        return int(self.sym_pos.shape[0])
+
+    def __getitem__(self, i) -> tuple[int, int]:
+        """单个样本的 (sym_pos, t) —— 抽样断言用,勿进热循环。"""
+        return int(self.sym_pos[i]), int(self.t[i])
+
+    def select(self, mask) -> "Samples":
+        """按布尔掩码或下标数组取子集(折内 train/valid/OOS 切分)。"""
+        return Samples(self.sym_pos[mask], self.t[mask], self.dates[mask])
+
+    @property
+    def keys(self) -> np.ndarray:
+        """打包成单个 int64 的样本身份,供集合运算(重叠检查)。"""
+        return (self.sym_pos.astype(np.int64) << 32) | self.t.astype(np.int64)
+
+    @property
+    def date_ints(self) -> np.ndarray:
+        """epoch 天数 (int64) —— 按日截面分组算 Rank IC 用。"""
+        return self.dates.astype("datetime64[D]").astype(np.int64)
+
+    def labels(self, store: "SequenceStore") -> np.ndarray:
+        """整段向量化取标签,返回与自身同序的 (N,) float32。"""
+        return store.label_flat[store.label_offsets[self.sym_pos] + self.t]
+
+
 class SequenceStore:
     """将因子面板长表转为 {symbol: (T, F) float32 矩阵} 并生成前向收益标签。
 
@@ -34,9 +77,11 @@ class SequenceStore:
         symbols: 排序后的股票代码列表
         dates_by_symbol: {symbol: (T,) datetime64 数组}
         factors_by_symbol: {symbol: (T, F) float32 矩阵,已填充无 NaN}
-        labels_by_symbol: {symbol: (T,) float32 前向收益(已截面缩尾),
-                          尾部 horizon 行为 NaN}
-        valid_by_symbol: {symbol: (T,) int16 标签窗口内有效交易日数}
+        label_flat: (总行数,) float32 前向收益(已截面缩尾),尾部 horizon
+                    行为 NaN;按 symbols 排序顺序拼接
+        valid_flat: (总行数,) int16 标签窗口内有效交易日数,同上顺序
+        label_offsets: (n_symbols + 1,) int64 —— symbol si 的行是
+                       label_flat[label_offsets[si]:label_offsets[si+1]]
         global_dates: 全部出现过的交易日(sorted datetime64 数组)
     """
 
@@ -144,8 +189,6 @@ class SequenceStore:
                 dtype=np.int16)
 
         # --- 标签按日截面缩尾(只使用当日横截面,与未来无关) ---
-        self.labels_by_symbol = {}
-        self.valid_by_symbol = {}
         date_concat = np.concatenate([self.dates_by_symbol[s]
                                       for s in self.symbols])
         lab_concat = np.concatenate([raw_labels[s] for s in self.symbols])
@@ -156,16 +199,13 @@ class SequenceStore:
             lambda x: x.clip(*x.quantile(self.label_winsor))
             if x.notna().any() else x)
 
-        lab_winsor = df["lab"].to_numpy(dtype=np.float32)
+        lengths = np.fromiter((len(self.dates_by_symbol[s]) for s in self.symbols),
+                              dtype=np.int64, count=len(self.symbols))
+        self.label_offsets = np.concatenate([[0], np.cumsum(lengths)])
+        self.label_flat = df["lab"].to_numpy(dtype=np.float32)
+        self.valid_flat = val_concat
 
-        pos = 0
-        for sym in self.symbols:
-            L = len(self.dates_by_symbol[sym])
-            self.labels_by_symbol[sym] = lab_winsor[pos:pos + L]
-            self.valid_by_symbol[sym] = val_concat[pos:pos + L]
-            pos += L
-
-        n_lab = int(np.isfinite(lab_winsor).sum())
+        n_lab = int(np.isfinite(self.label_flat).sum())
         logger.info(f"标签构建完成: {n_lab:,} 条有效前向收益标签"
                     f"(缩尾 [{self.label_winsor[0]:.0%}, "
                     f"{self.label_winsor[1]:.0%}])")
@@ -173,16 +213,15 @@ class SequenceStore:
     # ==================== 样本枚举 ====================
 
     def _candidate_index(self, min_date, max_date, require_label: bool
-                         ) -> tuple[list[tuple[int, int]], np.ndarray]:
-        """按窗口完整性(可选标签有效性)枚举样本 (sym_pos, t)。
+                         ) -> Samples:
+        """按窗口完整性(可选标签有效性)枚举样本。
 
         Args:
             require_label: True 时额外要求标签有效(训练/评估用);
                            False 时仅要求窗口完整(推理用,最新
                            horizon 个交易日没有标签也能预测)
         """
-        idx = []
-        all_dates = []
+        sym_parts, t_parts, date_parts = [], [], []
 
         for si, sym in enumerate(self.symbols):
             dates = self.dates_by_symbol[sym]
@@ -190,29 +229,34 @@ class SequenceStore:
             if T <= self.seq_len:
                 continue
 
+            lo, hi = self.label_offsets[si], self.label_offsets[si + 1]
             ok = np.zeros(T, dtype=bool)
             ok[self.seq_len - 1:] = True
             if require_label:
-                ok &= np.isfinite(self.labels_by_symbol[sym])
-                ok &= self.valid_by_symbol[sym] >= self.min_valid_label_days
+                ok &= np.isfinite(self.label_flat[lo:hi])
+                ok &= self.valid_flat[lo:hi] >= self.min_valid_label_days
             if min_date is not None:
                 ok &= dates >= np.datetime64(min_date)
             if max_date is not None:
                 ok &= dates <= np.datetime64(max_date)
 
             ts = np.nonzero(ok)[0]
-            idx.extend((si, int(t)) for t in ts)
-            all_dates.append(dates[ts])
+            if ts.size:
+                sym_parts.append(np.full(ts.size, si, dtype=np.int32))
+                t_parts.append(ts.astype(np.int32))
+                date_parts.append(dates[ts])
 
-        if not all_dates:
-            return [], np.array([], dtype="datetime64[ns]")
-        return idx, np.concatenate(all_dates)
+        if not date_parts:
+            return Samples(np.empty(0, np.int32), np.empty(0, np.int32),
+                           np.empty(0, dtype="datetime64[ns]"))
+        return Samples(np.concatenate(sym_parts), np.concatenate(t_parts),
+                       np.concatenate(date_parts))
 
     def sample_index(self,
                      min_date: np.datetime64 | pd.Timestamp | None = None,
                      max_date: np.datetime64 | pd.Timestamp | None = None
-                     ) -> tuple[list[tuple[int, int]], np.ndarray]:
-        """枚举所有可训练样本 (sym_pos, t) 及其日期。
+                     ) -> Samples:
+        """枚举所有可训练样本。
 
         条件:
             - t ≥ seq_len-1(窗口完整)
@@ -225,14 +269,14 @@ class SequenceStore:
             min_date/max_date: 可选日期范围(含端点)
 
         Returns:
-            (idx: [(sym_pos, t), ...], dates: np.ndarray (N,) datetime64)
+            Samples —— sym_pos/t/dates 三个数组同序
         """
         return self._candidate_index(min_date, max_date, require_label=True)
 
     def inference_index(self,
                         min_date: np.datetime64 | pd.Timestamp | None = None,
                         max_date: np.datetime64 | pd.Timestamp | None = None
-                        ) -> tuple[list[tuple[int, int]], np.ndarray]:
+                        ) -> Samples:
         """枚举所有可推理样本(不要求标签)。
 
         用于实盘信号:数据尾部 horizon 个交易日没有标签,但仍可预测。
@@ -253,7 +297,11 @@ class SequenceStore:
 
     def get_label(self, sym_pos: int, t: int) -> float:
         """返回样本 (sym_pos, t) 的前向收益标签。"""
-        return float(self.labels_by_symbol[self.symbols[sym_pos]][t])
+        return float(self.label_flat[self.label_offsets[sym_pos] + t])
+
+    def symbols_of(self, samples: Samples) -> np.ndarray:
+        """样本对应的股票代码数组(与 samples 同序)。"""
+        return np.take(self.symbols, samples.sym_pos)
 
 
 class SequenceDataset(Dataset):
@@ -265,61 +313,48 @@ class SequenceDataset(Dataset):
         date_int: 样本日期(epoch 天数 int64,评估 Rank IC 按日分组用)
     """
 
-    def __init__(self, store: SequenceStore,
-                 idx: list[tuple[int, int]],
-                 labels: np.ndarray | None = None,
-                 dates: np.ndarray | None = None):
-        """
-        Args:
-            store: SequenceStore
-            idx: [(sym_pos, t), ...] 样本索引
-            labels: 预取的 (N,) float32 标签(可选,加速;None 时惰性取)
-            dates: (N,) datetime64 样本日期(可选)
-        """
+    def __init__(self, store: SequenceStore, samples: Samples):
         self.store = store
-        self.idx = idx
-        self.labels = labels
-        # datetime64 → 天数整数(评估时按日分组)
-        self.date_ints = (dates.astype("datetime64[D]").astype(np.int64)
-                          if dates is not None else None)
+        self.sym_pos = samples.sym_pos
+        self.t = samples.t
+        # 标签和日期整段预取:每样本一次 Python 调用换成一次 fancy index
+        self.labels = samples.labels(store)
+        self.date_ints = samples.date_ints
 
     def __len__(self) -> int:
-        return len(self.idx)
+        return int(self.sym_pos.shape[0])
 
     def __getitem__(self, i: int) -> tuple:
-        si, t = self.idx[i]
-        x = torch.from_numpy(self.store.get_window(si, t))
-        y = (self.labels[i] if self.labels is not None
-             else self.store.get_label(si, t))
-        y = torch.tensor(y, dtype=torch.float32)
-        if self.date_ints is not None:
-            return x, y, self.date_ints[i]
-        return x, y
+        x = torch.from_numpy(self.store.get_window(int(self.sym_pos[i]),
+                                                   int(self.t[i])))
+        return (x, torch.tensor(self.labels[i], dtype=torch.float32),
+                self.date_ints[i])
 
 
-def make_loaders(store: SequenceStore,
-                 idx: list[tuple[int, int]],
-                 dates: np.ndarray,
-                 batch_size: int,
-                 shuffle: bool = False,
-                 num_workers: int = 0,
-                 pin_memory: bool = False,
-                 drop_last: bool = False,
-                 seed: int = 42) -> tuple[DataLoader, np.ndarray]:
-    """统一构建 DataLoader。
+def make_loader(store: SequenceStore,
+                samples: Samples,
+                batch_size: int,
+                shuffle: bool = False,
+                num_workers: int = 0,
+                pin_memory: bool = False,
+                drop_last: bool = False,
+                seed: int = 42) -> DataLoader:
+    """构建一个 DataLoader(标签请用 samples.labels(store) 单独取)。
 
-    Returns:
-        (loader, labels): labels 为预取的 (N,) float32 标签数组
-        (与 idx 同序,方便评估时对齐)
+    Args:
+        num_workers: >0 时自动开 persistent_workers。Windows 是 spawn 启动,
+            每个 worker 要把整个 store(~136 MB)重新 pickle 一遍,不持久化
+            就每 epoch 重付一次这笔钱;要真正提速得把取窗口挪到 GPU 上,
+            所以这里只是把 config 的值接进来,不擅自改默认。
+        seed: shuffle 复现用
     """
-    labels = np.array([store.get_label(si, t) for si, t in idx],
-                      dtype=np.float32) if idx else np.array([], dtype=np.float32)
-    ds = SequenceDataset(store, idx, labels=labels, dates=dates)
+    ds = SequenceDataset(store, samples)
     gen = torch.Generator().manual_seed(seed) if shuffle else None
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                        num_workers=num_workers, pin_memory=pin_memory,
-                        drop_last=drop_last, generator=gen)
-    return loader, labels
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                      num_workers=num_workers,
+                      persistent_workers=num_workers > 0,
+                      pin_memory=pin_memory, drop_last=drop_last,
+                      generator=gen)
 
 
 # ==================== Walk-Forward 窗口 ====================

@@ -36,7 +36,11 @@ model:
     early_stop_patience: 10
     early_stop_metric: "rank_ic"   # 模型选择指标:rank_ic / loss
     use_amp: true                  # 仅 cuda 生效,CPU 自动禁用
-    num_workers: 0                 # Windows 下固定 0
+    num_workers: 0                 # 已接线:>0 时 DataLoader 多进程取窗口。
+                                   # Windows 是 spawn,每个 worker 要把整个
+                                   # store(~130 MB)重新 pickle 一遍(已自动
+                                   # 开 persistent_workers,每折只付一次),
+                                   # 所以真正提速要靠 GPU 上取窗口,不是加 worker
     seed: 42
   walk_forward:
     min_train_months: 24           # 首个 OOS 窗口前的最短训练期(月,同 quantlab)

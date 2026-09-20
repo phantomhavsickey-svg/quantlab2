@@ -67,7 +67,8 @@ def load_factor_panel(path: str) -> pd.DataFrame:
 # ==================== 日线 ====================
 
 def load_daily_dict(daily_dir: str,
-                    symbols: list[str]) -> dict[str, pd.DataFrame]:
+                    symbols: list[str],
+                    columns: list[str] | None = None) -> dict[str, pd.DataFrame]:
     """加载日线缓存 {symbol: DataFrame(中文列名)}。
 
     只加载 symbols 列表中的股票(999 个 parquet 是主要 IO 耗时项,
@@ -76,6 +77,9 @@ def load_daily_dict(daily_dir: str,
     Args:
         daily_dir: 日线缓存目录(内含 {symbol}.parquet)
         symbols: 需要加载的股票代码列表
+        columns: 只读这些列。parquet 是列存,裁列就是裁 IO;
+                 算标签传 [日期, 收盘] 足够,回测撮合要 开盘 就不能裁。
+                 None = 全部列
 
     Returns:
         {symbol: DataFrame},日期升序、日期列为 datetime
@@ -94,7 +98,7 @@ def load_daily_dict(daily_dir: str,
         if not f.exists():
             missing += 1
             continue
-        df = pd.read_parquet(f)
+        df = pd.read_parquet(f, columns=columns)
         if DATE_COL not in df.columns or CLOSE_COL not in df.columns:
             raise ValueError(f"日线文件缺少 {DATE_COL}/{CLOSE_COL} 列: {f}")
         df[DATE_COL] = pd.to_datetime(df[DATE_COL])
@@ -103,7 +107,8 @@ def load_daily_dict(daily_dir: str,
 
     if missing:
         logger.warning(f"{missing} 只股票缺少日线文件(标签将为 NaN 并被过滤)")
-    logger.info(f"加载日线: {len(data)} 只股票")
+    logger.info(f"加载日线: {len(data)} 只股票,"
+                f"{'全部列' if columns is None else f'{len(columns)} 列'}")
     return data
 
 

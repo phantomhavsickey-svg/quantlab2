@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from models.trainer import TransformerTrainer
-from models.sequence_data import walk_forward_windows, FoldWindow
+from models.sequence_data import Samples, walk_forward_windows, FoldWindow
 
 HORIZON = 20
 SEQ_LEN = 20
@@ -27,13 +27,14 @@ def make_store(n_days=1400, start="2021-01-04"):
 
 
 def make_samples(store, per_day=50):
-    """造 (sym, t) 样本下标与日期数组,和 sample_index() 同形状。"""
-    all_idx, all_dates = [], []
-    for t in range(SEQ_LEN, len(store.global_dates)):
+    """造 Samples,和 store.sample_index() 同形状。"""
+    sym, t, dates = [], [], []
+    for ti in range(SEQ_LEN, len(store.global_dates)):
         for s in range(per_day):
-            all_idx.append((s, t))
-            all_dates.append(store.global_dates[t])
-    return all_idx, np.asarray(all_dates)
+            sym.append(s)
+            t.append(ti)
+            dates.append(store.global_dates[ti])
+    return Samples(sym, t, np.asarray(dates))
 
 
 def make_trainer(val_months=3, embargo_days=0):
@@ -46,10 +47,10 @@ def make_trainer(val_months=3, embargo_days=0):
 
 def split(store, w, **kw):
     trainer = make_trainer(**kw)
-    all_idx, all_dates = make_samples(store)
-    tr, va, info = TransformerTrainer._fold_split(trainer, store, all_idx,
-                                                  all_dates, w)
-    return tr, va, info, all_idx, all_dates
+    samples = make_samples(store)
+    tr, va, info = TransformerTrainer._fold_split(trainer, store,
+                                                  samples.dates, w)
+    return tr, va, info, samples, samples.dates
 
 
 FOLD = FoldWindow(fold=1, ws=pd.Timestamp("2023-01-04"),
@@ -59,15 +60,15 @@ FOLD = FoldWindow(fold=1, ws=pd.Timestamp("2023-01-04"),
 def test_train_and_valid_are_disjoint():
     """P0-6:验证集绝不能是训练集的子集。"""
     store = make_store()
-    tr, va, _, all_idx, _ = split(store, FOLD)
-    a = {all_idx[i] for i in np.nonzero(tr)[0]}
-    b = {all_idx[i] for i in np.nonzero(va)[0]}
+    tr, va, _, samples, _ = split(store, FOLD)
+    a = {samples[i] for i in np.nonzero(tr)[0]}
+    b = {samples[i] for i in np.nonzero(va)[0]}
     assert a.isdisjoint(b), f"train ∩ valid = {len(a & b)} 条"
 
 
 def test_three_ranges_do_not_overlap():
     store = make_store()
-    tr, va, info, all_idx, all_dates = split(store, FOLD)
+    tr, va, info, samples, all_dates = split(store, FOLD)
     ws, we = np.datetime64(FOLD.ws), np.datetime64(FOLD.we)
     oos = (all_dates >= ws) & (all_dates < we)
     for name, a in (("train", tr), ("valid", va)):

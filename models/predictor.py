@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from models.sequence_data import SequenceStore, make_loaders
+from models.sequence_data import SequenceStore, Samples, make_loader
 
 
 def _normalize_multiindex(mi: pd.MultiIndex) -> pd.MultiIndex:
@@ -124,28 +124,29 @@ class TransformerPredictor:
         self.cfg = cfg
         self.device = device
         self.batch_size = batch_size
+        self.num_workers = int(cfg["model"]["training"].get("num_workers", 0))
 
     # ==================== 批量推理 ====================
 
-    def _predict_indices(self, idx: list[tuple[int, int]],
-                         dates: np.ndarray) -> pd.Series:
-        """对 (sym_pos, t) 索引集合批量推理。
+    def _predict_indices(self, samples: Samples) -> pd.Series:
+        """对样本集合批量推理。
 
         Returns:
             Series MultiIndex (date, symbol),name="prediction"
         """
-        if not idx:
+        if len(samples) == 0:
             return pd.Series(dtype=float,
                              name="prediction",
                              index=pd.MultiIndex.from_arrays(
                                  [[], []], names=["date", "symbol"]))
-        loader, _ = make_loaders(self.store, idx, dates,
-                                 batch_size=self.batch_size, shuffle=False)
+        loader = make_loader(self.store, samples,
+                             batch_size=self.batch_size, shuffle=False,
+                             num_workers=self.num_workers)
         with torch.no_grad():
             preds = self._run_loader(loader)
-        symbols = [self.store.symbols[si] for si, _ in idx]
-        index = pd.MultiIndex.from_arrays([dates, symbols],
-                                          names=["date", "symbol"])
+        index = pd.MultiIndex.from_arrays(
+            [samples.dates, self.store.symbols_of(samples)],
+            names=["date", "symbol"])
         return pd.Series(preds, index=index, name="prediction")
 
     def predict(self, min_date=None, max_date=None) -> pd.Series:
@@ -153,9 +154,9 @@ class TransformerPredictor:
 
         注意:用 inference_index(不要求标签),数据尾部也能预测。
         """
-        idx, dates = self.store.inference_index(min_date, max_date)
-        logger.info(f"推理样本数: {len(idx):,}")
-        return self._predict_indices(idx, dates)
+        samples = self.store.inference_index(min_date, max_date)
+        logger.info(f"推理样本数: {len(samples):,}")
+        return self._predict_indices(samples)
 
     def predict_asof(self, asof: pd.Timestamp | str) -> pd.Series:
         """对 ≤ asof 的最近一个截面完整的交易日做全截面预测。
@@ -176,14 +177,13 @@ class TransformerPredictor:
             if n > best_n:
                 target, best_n = c, n
 
-        idx, dates = self.store.inference_index(min_date=target,
-                                                max_date=target)
-        if not idx:
+        samples = self.store.inference_index(min_date=target, max_date=target)
+        if len(samples) == 0:
             raise RuntimeError(f"日期 {pd.Timestamp(target).date()} "
                                f"无法构建样本窗口(seq_len 不足?)")
         logger.info(f"asof={asof} → 截面日期 "
-                    f"{pd.Timestamp(target).date()}, {len(idx)} 只股票")
-        return self._predict_indices(idx, dates)
+                    f"{pd.Timestamp(target).date()}, {len(samples)} 只股票")
+        return self._predict_indices(samples)
 
     def _n_symbols_on(self, d: np.datetime64) -> int:
         """统计某交易日有因子行的股票数(截面覆盖率)。"""

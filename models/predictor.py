@@ -39,7 +39,10 @@ def signals_from_predictions(predictions: pd.Series, top_k: int,
         predictions: Series MultiIndex (date, symbol),值为预测收益/分数
         top_k: 每期持仓股票数
         position_sizing: "equal_weight"(等权) / "signal_strength"(按强度加权)
-        tradable: 可交易性布尔 Series(同索引),可选
+        tradable: 可交易性布尔 Series(同索引,只含 True 项,缺席即不可选)。
+                  口径必须是**信号日当天已知**的信息(如当日有没有成交),
+                  不能塞进成交日的涨跌停状态 —— 那是未来函数。
+                  任何"识别到某种状态才允许买入"的门控都从这里进。
 
     Returns:
         DataFrame MultiIndex (date, symbol),列 [score, rank, weight]
@@ -53,6 +56,11 @@ def signals_from_predictions(predictions: pd.Series, top_k: int,
     if isinstance(predictions.index, pd.MultiIndex):
         predictions = predictions.copy()
         predictions.index = _normalize_multiindex(predictions.index)
+    if tradable is not None and isinstance(tradable.index, pd.MultiIndex):
+        # 掩码与预测的 date 层级 dtype 不一致时 xs 会静默失配 → 过滤形同
+        # 不存在。统一 dtype 后才对齐。
+        tradable = tradable.copy()
+        tradable.index = _normalize_multiindex(tradable.index)
 
     # 1. 截面降序排名(高分在前)
     rankings = predictions.groupby(level="date").rank(ascending=False)

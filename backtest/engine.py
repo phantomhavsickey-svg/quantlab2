@@ -1,21 +1,34 @@
 """
-向量化回测引擎 — 模拟多股票多期调仓，计算净值曲线。
+回测引擎 — 月度调仓撮合 + 逐日盯市,含交易成本与可交易性约束。
 
-与 quantlab 完全一致,保证 LightGBM vs Transformer 对比公平。
+2026-09 执行层修复后的四条口径变化(相对 quantlab 的同名引擎):
+    1. 建仓按"目标市值 - 现有市值"的差额下单。旧实现是
+       `buy_capital = cash / len(target)` 再按 DataFrame 行序逐个买到没钱,
+       低换手的月份里新入选股票只分到卖出回笼资金的 1/N,等权是名义上的。
+    2. 盯市区间改用**该区间实际持有的组合**。旧实现先更新持仓、再回补上一
+       个月的每日净值,等于每个月都用下一个月末才决定的组合给上个月估值,
+       日收益/夏普/最大回撤里混进一个月的前视。
+    3. 涨停不买、跌停不卖、停牌或当日无 bar 不成交 —— 与实盘共用
+       utils/market_rules.py 的判定,不再"回测假设成交、实盘被拒单"。
+    4. 持仓股票当日缺 bar 时沿用最近有效收盘估值,市值不再从净值里凭空消失;
+       另加显式 T+1:当日买入的股份不可当日卖出。
 """
 
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from collections import Counter
 from loguru import logger
 from tqdm import tqdm
 
 from backtest.cost import TransactionCostModel
 from backtest.metrics import PerformanceMetrics
+from utils.market_rules import can_fill, DATE_COL
+from utils.sizing import rebalance_plan, scale_buys_to_budget
 
 
 class BacktestEngine:
-    """向量化回测引擎。
+    """事件循环回测引擎(逐调仓日撮合,逐交易日盯市)。
 
     关键假设：
         - 日频回测，信号在调仓日收盘后生成
@@ -29,17 +42,20 @@ class BacktestEngine:
                  initial_capital: float = 1_000_000,
                  rebalance_frequency: str = "monthly",
                  max_positions: int = 30,
-                 cost_model: TransactionCostModel | None = None):
+                 cost_model: TransactionCostModel | None = None,
+                 lot_size: int = 100):
         """
         Args:
             initial_capital: 初始资金
             rebalance_frequency: 调仓频率 daily/weekly/monthly
-            max_positions: 最大持仓数
+            max_positions: 最大持仓数(信号端已按 Top-K 截断,此处仅记录)
             cost_model: 交易成本模型
+            lot_size: 一手股数
         """
         self.initial_capital = initial_capital
         self.rebalance_frequency = rebalance_frequency
         self.max_positions = max_positions
+        self.lot_size = lot_size
         self.cost = cost_model or TransactionCostModel()
         self.metrics = PerformanceMetrics()
 
@@ -59,17 +75,20 @@ class BacktestEngine:
         Returns:
             dict with keys:
                 - equity_curve: 每日净值 Series
+                - marks: 每日盯市明细 DataFrame(净值/现金/市值/持仓数)
                 - daily_returns: 每日收益率 Series
                 - trades: 所有成交记录 DataFrame
                 - positions: 每日持仓快照 DataFrame
                 - metrics: 绩效指标 dict
                 - benchmark_curve: 基准净值 Series (if provided)
+                - execution: 执行层诊断(持有期/换手/被挡指令/滞留现金)
         """
         logger.info(f"开始回测: 初始资金={self.initial_capital:,.0f}, "
                      f"持仓上限={self.max_positions}, "
                      f"调仓频率={self.rebalance_frequency}")
 
-        # 准备价格面板
+        # 价格面板 + 按日期预索引(旧实现在每个交易日里反复 set_index)
+        px = self._index_by_date(data_dict)
         price_df = self._build_price_panel(data_dict)
 
         # 获取调仓日期（signal 中实际存在的日期）
@@ -86,164 +105,160 @@ class BacktestEngine:
         logger.info(f"调仓日数量: {len(rebalance_dates)}")
 
         # 初始化
-        cash = self.initial_capital
+        cash = float(self.initial_capital)
         positions = {}        # {symbol: shares}
+        entry_date = {}       # {symbol: 建仓交易日} —— T+1 与持有期统计用
+        last_price = {}       # {symbol: 最近有效收盘} —— 缺行估值兜底
         equity_curve = []     # [(date, total_value)]
         all_trades = []       # 记录每笔成交
         all_positions = []    # 每日持仓快照
 
-        all_dates = sorted(price_df.index)
-        prev_positions_set = set()
+        all_dates = list(pd.DatetimeIndex(sorted(price_df.index)))
+        date_pos = {d: k for k, d in enumerate(all_dates)}
+        cursor = 0            # 下一个待盯市的日期下标
+        started = False       # 首个成交日之前不写净值(避免回标历史)
+
+        blocked_buy = Counter()
+        blocked_sell = Counter()
+        hold_days = []
+        turnover = []
+        idle_cash = []
 
         # 主循环：每个调仓日
-        for i, rebal_date in enumerate(tqdm(rebalance_dates, desc="回测进行中")):
+        for rebal_date in tqdm(rebalance_dates, desc="回测进行中"):
             # --- Step 1: 获取当日的目标组合 ---
             try:
                 day_signals = signals.xs(rebal_date, level="date")
             except KeyError:
                 continue
 
-            target_weights = day_signals[day_signals["weight"] > 0]
-            target_symbols = set(target_weights.index)
+            ws = day_signals[day_signals["weight"] > 0]["weight"]
+            weights = {str(s): float(v) for s, v in ws.items()}
 
             # --- Step 2: 找到下一个交易日（成交日） ---
             exec_date = self._next_date(all_dates, rebal_date)
-            if exec_date is None:
+            if exec_date is None or exec_date not in date_pos:
                 continue
+            ei = date_pos[exec_date]
 
-            # --- Step 3: 卖出不在目标组合中的持仓 ---
-            to_sell = prev_positions_set - target_symbols
-            for sym in to_sell:
-                if sym not in positions or positions[sym] <= 0:
+            # --- Step 3: 先把 [cursor, ei) 用"这段时间实际持有的组合"盯市 ---
+            # (修复:旧实现先更新持仓再回补上一区间,等于用下个月的组合给
+            #  这个月估值,日收益里混进一个调仓周期的前视)
+            if started:
+                for k in range(cursor, ei):
+                    self._mark_day(all_dates[k], positions, last_price, px,
+                                   cash, equity_curve, all_positions)
+            cursor = ei
+
+            # --- Step 4: 撮合价与可成交性(全部取自 exec_date 当日 bar) ---
+            universe = set(weights) | set(positions)
+            rows = {s: self._row(px, s, exec_date) for s in universe}
+            for s in universe:
+                cp = self._close_of(rows[s])
+                if cp is not None:
+                    last_price[s] = cp
+
+            def exec_price(sym):
+                o = self._open_of(rows.get(sym))
+                return o if o is not None else last_price.get(sym)
+
+            prices = {s: exec_price(s) for s in universe
+                      if exec_price(s) is not None}
+            equity = cash + sum(q * prices.get(s, last_price.get(s, 0.0))
+                                for s, q in positions.items())
+
+            # --- Step 5: 目标市值 - 现有市值 → 买卖差额(与实盘同一份数学) ---
+            plan = rebalance_plan(weights, positions, prices, equity,
+                                  lot_size=self.lot_size)
+
+            # --- Step 6: 卖出(先卖后买;跌停/停牌/T+1 挡下的留在持仓里) ---
+            for sym in sorted(plan.sells):
+                qty = min(plan.sells[sym], positions.get(sym, 0))
+                if qty <= 0:
                     continue
-                if sym not in data_dict:
+                if entry_date.get(sym) == exec_date:
+                    blocked_sell["T+1 当日买入"] += 1
                     continue
-
-                df_sym = data_dict[sym].set_index("日期")
-                if exec_date not in df_sym.index:
+                ok, why = can_fill(rows.get(sym), sym, "sell")
+                if not ok:
+                    blocked_sell[why] += 1
                     continue
-
-                sell_price = df_sym.loc[exec_date, "开盘"]
-                shares = positions[sym]
-                amount = sell_price * shares
-
-                # 计算成本
+                sell_price = prices[sym]
+                amount = sell_price * qty
                 cost = self.cost.total_cost(amount, "sell")
-                proceeds = amount - cost
-
-                cash += proceeds
+                cash += amount - cost
+                if entry_date.get(sym) is not None:
+                    hold_days.append(self._holding_days(
+                        date_pos, entry_date[sym], exec_date))
+                if qty >= positions[sym]:
+                    del positions[sym]
+                    entry_date.pop(sym, None)
+                else:
+                    positions[sym] -= qty
 
                 all_trades.append({
                     "date": exec_date,
                     "symbol": sym,
                     "side": "sell",
                     "price": sell_price,
+                    "shares": qty,
+                    "amount": amount,
+                    "cost": cost,
+                    "net_proceeds": amount - cost,
+                })
+
+            # --- Step 7: 买入(钱不够时按剩余现金等比缩量,与下单顺序无关) ---
+            scale_buys_to_budget(plan, cash, prices, lot_size=self.lot_size,
+                                 fee_rate_buy=self.cost.effective_cost_rate(
+                                     "buy"))
+            traded = 0.0
+            for sym in sorted(plan.buys):
+                shares = plan.buys[sym]
+                ok, why = can_fill(rows.get(sym), sym, "buy")
+                if not ok:
+                    blocked_buy[why] += 1
+                    continue
+                buy_price = prices[sym]
+                amount = buy_price * shares
+                cost = self.cost.total_cost(amount, "buy")
+                if amount + cost > cash:
+                    blocked_buy["现金不足"] += 1
+                    continue
+
+                cash -= amount + cost
+                positions[sym] = positions.get(sym, 0) + shares
+                entry_date.setdefault(sym, exec_date)
+                traded += amount
+
+                all_trades.append({
+                    "date": exec_date,
+                    "symbol": sym,
+                    "side": "buy",
+                    "price": buy_price,
                     "shares": shares,
                     "amount": amount,
                     "cost": cost,
-                    "net_proceeds": proceeds,
+                    "net_proceeds": -(amount + cost),
                 })
 
-                del positions[sym]
+            if equity > 0:
+                turnover.append(traded / equity)
+            invested = sum(q * prices.get(s, last_price.get(s, 0.0))
+                           for s, q in positions.items())
+            if equity > 0 and invested / equity < 0.98:
+                idle_cash.append(cash)
+            started = True
 
-            # --- Step 4: 买入目标组合 ---
-            if target_symbols:
-                # 计算买入金额
-                buy_capital = cash / max(len(target_symbols), 1)
-                # 等权分配
-                for sym, row in target_weights.iterrows():
-                    if sym not in data_dict:
-                        continue
+            # --- Step 8: 成交日当天用撮合后的新组合盯市 ---
+            self._mark_day(exec_date, positions, last_price, px, cash,
+                           equity_curve, all_positions)
+            cursor = ei + 1
 
-                    df_sym = data_dict[sym].set_index("日期")
-                    if exec_date not in df_sym.index:
-                        continue
-
-                    buy_price = df_sym.loc[exec_date, "开盘"]
-
-                    # 整手买入（100股的整数倍）
-                    target_amount = buy_capital * 1.0  # equal weight
-                    shares = self.cost.round_lot(int(target_amount / buy_price))
-                    if shares <= 0:
-                        continue
-
-                    amount = buy_price * shares
-                    cost = self.cost.total_cost(amount, "buy")
-                    total_cost = amount + cost
-
-                    if total_cost > cash:
-                        # 钱不够，减少股数
-                        shares = self.cost.round_lot(
-                            int((cash * 0.99 - self.cost.min_commission) / buy_price)
-                        )
-                        if shares <= 0:
-                            continue
-                        amount = buy_price * shares
-                        cost = self.cost.total_cost(amount, "buy")
-                        total_cost = amount + cost
-
-                    cash -= total_cost
-                    positions[sym] = positions.get(sym, 0) + shares
-
-                    all_trades.append({
-                        "date": exec_date,
-                        "symbol": sym,
-                        "side": "buy",
-                        "price": buy_price,
-                        "shares": shares,
-                        "amount": amount,
-                        "cost": cost,
-                        "net_proceeds": -total_cost,
-                    })
-
-            prev_positions_set = set(positions.keys())
-
-            # --- Step 5: 每日盯市（从上个调仓日到当前调仓日） ---
-            if i == 0:
-                # 首个调仓日之前没有持仓：从首个成交日开始盯市，
-                # 避免用首个组合回标历史价格产生虚假的期初波动
-                start_idx = all_dates.index(exec_date)
-            else:
-                # 从上个成交日的次日起（上个成交日已在上一轮盯市）
-                start_idx = all_dates.index(
-                    self._next_date(all_dates, rebalance_dates[i-1])
-                    or all_dates[0]) + 1
-            end_idx = all_dates.index(exec_date) + 1
-            if i == len(rebalance_dates) - 1:
-                end_idx = len(all_dates)
-
-            for j in range(start_idx, end_idx):
-                d = all_dates[j]
-                # 计算持仓市值
-                total_market_value = 0.0
-                for sym, shares in positions.items():
-                    if sym in data_dict:
-                        df_sym = data_dict[sym].set_index("日期")
-                        if d in df_sym.index:
-                            close_price = df_sym.loc[d, "收盘"]
-                            total_market_value += close_price * shares
-
-                total_value = cash + total_market_value
-
-                equity_curve.append({
-                    "date": d,
-                    "total_value": total_value,
-                    "cash": cash,
-                    "market_value": total_market_value,
-                    "n_positions": len(positions),
-                })
-
-                # 持仓快照
-                for sym, shares in positions.items():
-                    if sym in data_dict:
-                        df_sym = data_dict[sym].set_index("日期")
-                        if d in df_sym.index:
-                            all_positions.append({
-                                "date": d,
-                                "symbol": sym,
-                                "shares": shares,
-                                "price": df_sym.loc[d, "收盘"],
-                            })
+        # 最后一个调仓日之后继续盯市到数据末端
+        if started:
+            for k in range(cursor, len(all_dates)):
+                self._mark_day(all_dates[k], positions, last_price, px, cash,
+                               equity_curve, all_positions)
 
         # ==================== 最终输出 ====================
 
@@ -280,19 +295,108 @@ class BacktestEngine:
             perf = self.metrics.compute_all(equity_df["equity"],
                                              trades=trades_df)
 
+        # 执行层诊断(把"学 20 日 / 持有到月末"这类口径差量化出来)
+        execution = {
+            "blocked_buy": dict(blocked_buy),
+            "blocked_sell": dict(blocked_sell),
+            "n_blocked_buy": int(sum(blocked_buy.values())),
+            "n_blocked_sell": int(sum(blocked_sell.values())),
+            "median_hold_days": float(np.median(hold_days)) if hold_days
+            else float("nan"),
+            "p90_hold_days": float(np.percentile(hold_days, 90))
+            if hold_days else float("nan"),
+            "n_exit_trades": len(hold_days),
+            "mean_turnover": float(np.mean(turnover)) if turnover else 0.0,
+            "n_underinvested_rebalances": len(idle_cash),
+            "mean_idle_cash": float(np.mean(idle_cash)) if idle_cash else 0.0,
+            "final_cash": float(cash),
+        }
+
         # 打印结果
-        self._print_summary(perf)
+        self._print_summary(perf, execution)
 
         return {
             "equity_curve": equity_df["equity"],
+            "marks": equity_df,
             "daily_returns": daily_returns,
             "trades": trades_df,
             "positions": positions_df,
             "metrics": perf,
             "benchmark_curve": bm_curve,
+            "execution": execution,
         }
 
+    # ==================== 盯市 ====================
+
+    @staticmethod
+    def _mark_day(d, positions, last_price, px, cash,
+                  equity_curve, all_positions):
+        """用**当前**持仓给某天估值;当日缺 bar 的股票沿用最近有效收盘。"""
+        total_market_value = 0.0
+        for sym, shares in positions.items():
+            cp = BacktestEngine._close_of(BacktestEngine._row(px, sym, d))
+            if cp is not None:
+                last_price[sym] = cp
+            price = last_price.get(sym)
+            if price is None:
+                continue          # 从未有过有效收盘 → 无法计入(不应发生)
+            total_market_value += price * shares
+            all_positions.append({
+                "date": d,
+                "symbol": sym,
+                "shares": shares,
+                "price": price,
+            })
+
+        total_value = cash + total_market_value
+        equity_curve.append({
+            "date": d,
+            "total_value": total_value,
+            "cash": cash,
+            "market_value": total_market_value,
+            "n_positions": len(positions),
+        })
+
     # ==================== 辅助方法 ====================
+
+    @staticmethod
+    def _index_by_date(data_dict: dict) -> dict:
+        """{symbol: 以日期为索引的 DataFrame},整场回测只建一次。"""
+        out = {}
+        for sym, df in data_dict.items():
+            if df is None or len(df) == 0 or "日期" not in df.columns:
+                continue
+            s = df.set_index("日期")
+            s.index = pd.DatetimeIndex(s.index)
+            out[str(sym)] = s[~s.index.duplicated(keep="last")].sort_index()
+        return out
+
+    @staticmethod
+    def _row(px: dict, sym, d):
+        df = px.get(str(sym))
+        if df is None or d not in df.index:
+            return None
+        return df.loc[d]
+
+    @staticmethod
+    def _open_of(row):
+        if row is None or "开盘" not in row.index:
+            return None
+        v = row["开盘"]
+        return None if v is None or pd.isna(v) or float(v) <= 0 else float(v)
+
+    @staticmethod
+    def _close_of(row):
+        if row is None or "收盘" not in row.index:
+            return None
+        v = row["收盘"]
+        return None if v is None or pd.isna(v) or float(v) <= 0 else float(v)
+
+    @staticmethod
+    def _holding_days(date_pos: dict, entry, exit_) -> int:
+        a = date_pos.get(pd.Timestamp(entry))
+        b = date_pos.get(pd.Timestamp(exit_))
+        return b - a if a is not None and b is not None else 0
 
     @staticmethod
     def _build_price_panel(data_dict: dict) -> pd.DataFrame:
@@ -326,7 +430,7 @@ class BacktestEngine:
             return [d for d in signal_dates if d.weekday() == 4]
         return signal_dates
 
-    def _print_summary(self, metrics: dict):
+    def _print_summary(self, metrics: dict, execution: dict | None = None):
         """打印回测摘要。"""
         print("\n" + "=" * 60)
         print("  回测结果摘要")
@@ -342,4 +446,17 @@ class BacktestEngine:
             print(f"  信息比率:     {metrics.get('information_ratio', 0):8.2f}")
         print(f"  总交易次数:   {metrics.get('total_trades', 0)}")
         print(f"  交易总成本:   {metrics.get('total_cost', 0):,.0f} 元")
+        if execution:
+            print("  --- 执行层诊断 ---")
+            print(f"  中位持有交易日: {execution['median_hold_days']:.0f}"
+                  f" (p90 {execution['p90_hold_days']:.0f},"
+                  f" 减仓/平仓 {execution['n_exit_trades']} 笔)")
+            print(f"  平均单次换手率: {execution['mean_turnover']*100:.1f}%")
+            print(f"  买入被挡 {execution['n_blocked_buy']} 笔: "
+                  f"{execution['blocked_buy'] or '无'}")
+            print(f"  卖出被挡 {execution['n_blocked_sell']} 笔: "
+                  f"{execution['blocked_sell'] or '无'}")
+            print(f"  欠配调仓次数: {execution['n_underinvested_rebalances']},"
+                  f" 该些次平均滞留现金 "
+                  f"{execution['mean_idle_cash']:,.0f} 元")
         print("=" * 60 + "\n")

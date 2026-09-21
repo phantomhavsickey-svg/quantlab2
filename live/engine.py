@@ -32,6 +32,18 @@ from live.journal import TradeJournal
 from live.orders import make_orders, export_orders
 from live.risk import RiskManager
 from live.__init__ import SinaQuoteFeed, Quote
+from utils.market_rules import at_limit_up, at_limit_down
+
+
+def _num(row, col, default=None):
+    """从日线一行里取数,缺失/NaN 时给默认值(行情退化时用)。"""
+    try:
+        v = row[col]
+    except (KeyError, IndexError):
+        return default
+    if v is None or pd.isna(v):
+        return default
+    return float(v)
 
 
 class LiveEngine:
@@ -58,7 +70,10 @@ class LiveEngine:
         self.rebalance_time = live_cfg.get("rebalance_time", "09:35")
         self.poll_interval = float(live_cfg.get("poll_interval", 5))
         self.rebalance_day = live_cfg.get("rebalance_day", "month_end")
-        self.top_k = config["backtest"]["max_positions"]
+        # 实际选股名额取自 predict 段(generate_signals 用的就是它),
+        # 之前读 backtest.max_positions 只是日志里数字对得上而已
+        self.top_k = int(config["predict"].get(
+            "top_k", config["backtest"]["max_positions"]))
         self.order_dir = live_cfg.get("order_dir", "live/output")
 
         self.risk = RiskManager(live_cfg.get("risk", {}))
@@ -68,6 +83,10 @@ class LiveEngine:
         # 初始资金取自配置(与具体券商解耦;none 模式无 initial_cash 属性)
         self.initial_capital = float(
             config["backtest"].get("initial_capital", 1_000_000))
+        # 买入单边费率:资金不足时按"含费"缩量,与回测引擎同一条算式
+        mkt = config.get("market", {})
+        self.fee_rate_buy = float(mkt.get("commission_rate", 0.0003)) + \
+            float(mkt.get("slippage_rate", 0.001))
 
         self._load_model()
         self.done_rebalance_today = False
@@ -84,7 +103,8 @@ class LiveEngine:
         sys.path.insert(0, str(Path(__file__).parent.parent))
 
         from main import build_store, latest_checkpoint
-        from data.loader import load_factor_panel
+        from data.loader import load_factor_panel, EXEC_DAILY_COLS
+        from utils.market_rules import build_tradable_mask
         from models.trainer import TransformerTrainer
         from models.predictor import TransformerPredictor
         from utils.device import get_device
@@ -99,7 +119,8 @@ class LiveEngine:
             ckpt, self.device)
         self.panel = load_factor_panel(
             self.config["data"]["factor_panel"])
-        self.store, self.daily = build_store(self.config, self.panel)
+        self.store, self.daily = build_store(
+            self.config, self.panel, columns=EXEC_DAILY_COLS)
         self.predictor = TransformerPredictor(
             self.model, self.store, self.config, self.device)
         logger.info(f"实时引擎就绪: checkpoint={ckpt}, "
@@ -125,7 +146,12 @@ class LiveEngine:
         """
         asof = self._signal_asof(ref_date)
         preds = self.predictor.predict_asof(asof)
-        signals = self.predictor.generate_signals(predictions=preds)
+        # 信号日已停牌/无成交的股票不占 Top-K 名额(与回测同一份掩码口径)
+        signals = self.predictor.generate_signals(
+            predictions=preds,
+            tradable=build_tradable_mask(
+                self.daily,
+                preds.index.get_level_values("date").unique()))
         self.last_signal_date = preds.index.get_level_values("date")[0]
         day = signals[signals["weight"] > 0]
         # 权重 key 取 symbol 层级(索引是 (date, symbol) MultiIndex)
@@ -179,17 +205,21 @@ class LiveEngine:
                 snapshot[sym] = {
                     "open": q.open, "high": q.high, "low": q.low,
                     "close": q.price, "volume": q.volume,
-                    "at_limit_up": q.change_pct >= 9.5,
-                    "at_limit_down": q.change_pct <= -9.5,
+                    "at_limit_up": at_limit_up(sym, q.change_pct),
+                    "at_limit_down": at_limit_down(sym, q.change_pct),
                 }
             elif sym in self.daily:
-                df = self.daily[sym]
-                row = df.iloc[-1]
+                row = self.daily[sym].iloc[-1]
+                close = _num(row, "收盘")
                 snapshot[sym] = {
-                    "open": float(row["开盘"]), "high": float(row["最高"]),
-                    "low": float(row["最低"]), "close": float(row["收盘"]),
-                    "volume": float(row.get("成交量", 0) or 0),
-                    "at_limit_up": False, "at_limit_down": False,
+                    # 日线缺 OHLC 时退化成"按收盘价成交"的退化 bar
+                    "open": _num(row, "开盘", close),
+                    "high": _num(row, "最高", close),
+                    "low": _num(row, "最低", close),
+                    "close": close,
+                    "volume": _num(row, "成交量", 0.0),
+                    "at_limit_up": at_limit_up(sym, _num(row, "涨跌幅")),
+                    "at_limit_down": at_limit_down(sym, _num(row, "涨跌幅")),
                 }
         return snapshot
 
@@ -217,7 +247,10 @@ class LiveEngine:
             # (真实券商没有持仓/资金查询,这正是指令文件的用途)
             cash = self.initial_capital
         orders = make_orders(target, positions, cash, ref_prices,
-                             lot_size=self.config["market"].get("lot_size", 100))
+                             lot_size=self.config["market"].get(
+                                 "lot_size", 100),
+                             max_total_pct=self.risk.max_total_pct,
+                             fee_rate_buy=self.fee_rate_buy)
 
         # 4. 风控过滤(阻断式)
         total_value = self.broker.get_total_value()

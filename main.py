@@ -38,18 +38,22 @@ def load_config(path: str = "config.yaml") -> dict:
 
 # ==================== 公共:数据加载 ====================
 
-def build_store(config: dict, panel: pd.DataFrame):
+def build_store(config: dict, panel: pd.DataFrame,
+                columns: list[str] | None = None):
     """从因子面板 + 日线构建 SequenceStore。
 
-    日线只需要 日期/收盘 两列(算前向收益标签用),parquet 是列存,
+    日线默认只要 日期/收盘 两列(算前向收益标签够用),parquet 是列存,
     裁剪列能砍掉绝大部分解析量 —— 999 个文件逐个读时这个差别是分钟级。
+    实盘引擎还要用 开盘/最高/最低/成交量/涨跌幅 做撮合与盯市,那种调用方
+    自己传 columns(SequenceStore 只认 日期/收盘,多给不改变任何结果)。
     """
     from data.loader import load_daily_dict, DATE_COL, CLOSE_COL
     from models.sequence_data import SequenceStore
 
     symbols = sorted(panel["symbol"].unique())
+    cols = list(columns) if columns is not None else [DATE_COL, CLOSE_COL]
     daily = load_daily_dict(config["data"]["daily_dir"], symbols,
-                            columns=[DATE_COL, CLOSE_COL])
+                            columns=cols)
     store = SequenceStore(panel, daily, config)
     return store, daily
 
@@ -133,18 +137,22 @@ def cmd_backtest(args):
     logger.info(f"OOS RankIC = {ic['mean_ic']:.4f} | ICIR = {ic['icir']:.2f}"
                 f" | 有效截面 {ic['n_days']} 天")
 
-    # 生成信号
+    # 日线数据:先加载再选股 —— 可交易掩码要知道信号日有没有成交
+    from data.loader import load_daily_dict, EXEC_DAILY_COLS
+    from utils.market_rules import build_tradable_mask
+    symbols = sorted(preds["symbol"].unique())
+    daily = load_daily_dict(config["data"]["daily_dir"], symbols,
+                            columns=EXEC_DAILY_COLS)
+
+    # 生成信号(信号日已停牌/无成交的股票不占 Top-K 名额)
     from models.predictor import signals_from_predictions
     predictions = preds.set_index(["date", "symbol"])["prediction"]
+    signal_dates = predictions.index.get_level_values("date").unique()
     signals = signals_from_predictions(
         predictions,
         top_k=config["backtest"]["max_positions"],
-        position_sizing=config["backtest"]["position_sizing"])
-
-    # 日线数据(只加载信号涉及的股票)
-    from data.loader import load_daily_dict
-    symbols = sorted(signals.index.get_level_values("symbol").unique())
-    daily = load_daily_dict(config["data"]["daily_dir"], symbols)
+        position_sizing=config["backtest"]["position_sizing"],
+        tradable=build_tradable_mask(daily, signal_dates))
 
     # 基准指数(akshare 不可用时回退到股票池等权基准)
     from data.loader import load_benchmark, build_universe_benchmark
@@ -214,7 +222,8 @@ def cmd_predict(args):
     setup_logger(config["logging"]["level"], config["logging"]["file"])
     device = get_device()
 
-    from data.loader import load_factor_panel
+    from data.loader import load_factor_panel, EXEC_DAILY_COLS
+    from utils.market_rules import build_tradable_mask
     from models.trainer import TransformerTrainer
     from models.predictor import TransformerPredictor
 
@@ -225,12 +234,16 @@ def cmd_predict(args):
 
     model, meta = TransformerTrainer.load_checkpoint(checkpoint, device)
     panel = load_factor_panel(config["data"]["factor_panel"])
-    store, _ = build_store(config, panel)
+    store, daily = build_store(config, panel, columns=EXEC_DAILY_COLS)
 
     predictor = TransformerPredictor(model, store, config, device)
     asof = args.asof or datetime.now().strftime("%Y-%m-%d")
     predictions = predictor.predict_asof(asof)
-    signals = predictor.generate_signals(predictions=predictions)
+    # 信号日已停牌/无成交的股票不占 Top-K 名额
+    signals = predictor.generate_signals(
+        predictions=predictions,
+        tradable=build_tradable_mask(
+            daily, predictions.index.get_level_values("date").unique()))
 
     # 输出持仓信号 CSV
     out_dir = config["predict"]["output_dir"]

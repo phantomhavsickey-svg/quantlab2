@@ -40,6 +40,9 @@ tqdm>=4.66
 # A-share trading calendar (utils/calendar.py ported from quantlab)
 cn-stock-holidays>=2.0
 
+# realtime quotes (live module: Sina HTTP API, imported at module scope)
+requests>=2.31
+
 # benchmark index download (optional, falls back gracefully)
 akshare>=1.14.0
 

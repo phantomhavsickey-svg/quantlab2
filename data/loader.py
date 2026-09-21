@@ -19,6 +19,13 @@ from loguru import logger
 # 日线缓存列名(中文,来自 quantlab 下载器)
 DATE_COL = "日期"
 CLOSE_COL = "收盘"
+VOL_COL = "成交量"
+CHG_COL = "涨跌幅"
+
+# 撮合/盯市/可交易性判定要用的列。SequenceStore 只要 日期/收盘,但实盘引擎
+# 与回测引擎还要 开盘 定价、成交量/涨跌幅 判停牌与涨跌停,不能裁到两列。
+EXEC_DAILY_COLS = [DATE_COL, "开盘", "最高", "最低", CLOSE_COL,
+                   VOL_COL, CHG_COL]
 
 
 # ==================== 因子面板 ====================

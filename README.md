@@ -66,13 +66,56 @@ python main.py live --broker simulate          # 盘中 09:35 调仓 + 15:05 盯
 - 调仓流程：最新 checkpoint → Transformer 推理 → Top-K 等权目标
   → 先卖后买指令 → **阻断式风控**（单股仓位≤20%、总仓位≤95%、持仓≤50、
   涨停不买/跌停不卖/停牌跳过）→ 执行。
+  （`position_policy.enabled: true` 时第二步换成分数带位目标，见下节）
+
+### 分数带位仓位管理（`position_policy`，默认关闭）
+
+Top-K 等权 50 只的问题：权重与分数无关，第 50 名和第 1 名同仓，且月末一次性
+换手把全部筹码暴露在同一天的模型误差上。打开 `config.yaml` 的
+`position_policy.enabled` 后，"该买谁"不再是一个名单，而是**分数带 + 每只股票
+的建仓基准**的函数：
+
+| 规则 | 常量 | 语义 |
+|------|------|------|
+| 建仓线 / 清仓线 | `buy_score` / `sell_score` | 分数 ≥ 建仓线才有资格入场；跌破清仓线整只清空 |
+| 基准仓 | `base_weight` = 5% | 每笔建仓的绝对市值占比（`normalize=False`，归一化会让"5%"失去含义） |
+| 建仓上限 | `max_entry_weight` = 8% | 分数高出建仓线越多，首笔越大，到 `strong_score` 给满，封顶 8% |
+| 补仓触发 | Δ = `step_multiplier` × (建仓分数 − 建仓线) | 分数比 `ref_score` 高出 Δ 才补，Δ **冻结在该股建仓状态里**，下限 `step_score_floor` |
+| 持仓上限 | `max_position_weight` = 16% | 每档 `add_step_weight`，到 16% 锁死 |
+| 减仓 | 带内回落 | 分数下降但未跌破清仓线 → 每档 `trim_step_weight` 减仓，减到低于 `min_hold_weight` 改为清仓 |
+| 回补禁令 | `trim_price` | 减仓成交价记入状态，此后补仓的参考价不得高于它（有效期 `trim_price_ttl_days` 自然日，跨清仓仍保留） |
+| 最小笔额 | `min_trade_value` = 10000 | 小于一万不下单，下一轮分数继续走再试（不足一手的整数倍则跳过） |
+| 单次档数 | `max_steps_per_eval` = 2 | 一天最多补/减两档，防跳档 |
+
+状态机在 `utils/position_policy.py`（`policy_plan` → `Plan` + `intents`），
+回测 `backtest/engine.py` 与实盘 `live/engine.py` **调用同一份实现、同一个
+`policy_state.json` schema**，所以补仓/减仓的触发在两端数值一致。成交后才提交
+（`apply_fills`）：被涨跌停/停牌/资金不足挡下的单子不消耗分数触发，下一轮重算。
+
+几条口径上的必修漏洞，已按构造堵掉：
+
+- **预算跨轮生效**：`add_reserve_weight` 给补仓预留额度，且已持仓市值计入建仓
+  上限（`entry_cap`），否则每轮都能"再塞 12 只"，总仓位一路冲破 95%。
+- **含费预算**：`fee_rate_buy`（`market.commission_rate + slippage_rate`，由
+  `policy_from_config` 自动注入）计入权重，否则撮合端按比例缩量后 `ref_score`
+  永不推进，同一 Δ 反复触发补仓直到 16% 上限。同理 `max_total_pct` 取自
+  `live.risk`，两端共用一个上限。
+- **价格漂移不自发交易**：本轮算出差额但在带内的名字进 `keep`，目标锁死在当前
+  股数，只有分数变化才动。
+- **持仓数上限**：`max_names` 与 `base_weight` 一起校验（50 × 5% 无法在 95% 内
+  成立），启动即报错而不是静默欠配。
+
+⚠ 关闭时（当前默认）回测/实盘行为与既有发布数字完全一致；一旦 `enabled: true`，
+`buy_score`/`sell_score` 必须针对该模型口径重新校准（score = 预测 20 日收益率，
+回归头与分类头的量纲完全不同），且此前所有回测结论作废，需重跑。
 
 ### 实盘安全设计
 
 - `--confirm` 才真实下单；缺省只生成指令文件（`live/output/orders_*.csv`）
 - QMT 下 FIX_PRICE 限价单（以参考价为限价，滑点保护）
 - 模拟盘持仓状态每次成交后落盘（`live/state/simulate_state.json`），
-  进程被杀重启无损
+  进程被杀重启无损；带位策略的每只股票状态（`ref_score`/`trim_price`/已实现
+  档位）另存 `live/state/policy_state.json`，同样只在成交后推进
 
 ### QMT 实盘前置条件
 
@@ -118,7 +161,7 @@ quantlab2/
 │   ├── trainer.py          # 训练循环 / Rank IC / 早停 / checkpoint / Walk-Forward
 │   └── predictor.py        # 批量推理 → 截面排名 → Top-K → 信号
 ├── data/
-│   └── loader.py           # 读因子面板 / 日线 / 基准指数
+│   └── loader.py           # 读因子面板 / 日线（线程池并行）/ 基准指数（腾讯直连优先）
 ├── backtest/               # 移植自 quantlab(engine/cost/metrics/reporter)
 ├── utils/                  # 日志 / 交易日历 / 设备与随机种子
 ├── models/saved/           # checkpoint 输出
@@ -146,6 +189,12 @@ quantlab2/
 - 逐日 IC 落盘到 `reports/daily_ic.csv`（约 20 KB），显著性结论任何人可独立复算
 - **平均 OOS RankIC > 0.02 可用，> 0.05 优秀，< 0 无效**（与 quantlab 口径一致，可直接对比 LightGBM）
 - 回测报告输出年化收益/夏普/最大回撤/超额收益/信息比率，与 quantlab 在相同时间窗对比
+- **基准用的是哪一个要说清**：`load_benchmark` 优先取真实指数（腾讯直连，东财/akshare
+  的指数接口常被限流），拿不到才回退到**当前成分的等权组合**。后者带幸存者偏差、
+  系统性高于真实指数（quantlab 2026-09-22 同区间实测：等权 +55.7%、中证1000 指数 +12.2%），
+  所以它是更严苛的 hurdle，两个数不能混在一张表里解读
+- `config.yaml` 的 `data.factor_panel` / `data.daily_dir` 是**绝对路径**，换机器要改成
+  本机 quantlab 缓存的位置（缓存由 quantlab 的 `python main.py download` + `factors` 生成）
 - 断点续训：训练中断后重跑 `python main.py train` 会自动复用已有 checkpoint
   与逐折 OOS 预测；但缓存旁的 `predictions.parquet.meta.json` 记录了切分口径
   （horizon / val_months / embargo_days / 折宽度），口径一变即作废重训，

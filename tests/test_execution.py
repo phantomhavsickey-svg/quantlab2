@@ -14,6 +14,7 @@ from live.orders import make_orders
 from models.predictor import signals_from_predictions
 from utils.market_rules import (at_limit_down, at_limit_up, can_fill,
                                 get_limit_pct, build_tradable_mask)
+from utils.position_policy import PolicyConfig
 from utils.sizing import rebalance_plan, scale_buys_to_budget
 
 CAP = 1_000_000
@@ -80,13 +81,14 @@ def flag_on_exec_days(value):
     return chgs
 
 
-def run_bt(weights_by_date, data, freq="monthly", top_k=None):
+def run_bt(weights_by_date, data, freq="monthly", top_k=None, policy=None):
     sig = signals_from(weights_by_date)
     if top_k is None:
         first = next(iter(weights_by_date.values()))
         top_k = len(first)
     eng = BacktestEngine(initial_capital=CAP, rebalance_frequency=freq,
-                         max_positions=top_k, cost_model=TransactionCostModel())
+                         max_positions=top_k, cost_model=TransactionCostModel(),
+                         policy=policy)
     return eng.run(data, sig)
 
 
@@ -340,3 +342,156 @@ def test_backtest_and_live_size_the_same_plan():
           make_orders(weights, {}, float(CAP), prices, fee_rate_buy=BUY_FEE)}
     assert bt == lv, (bt, lv)
     assert sum(q * 10.0 for q in lv.values()) > 0.97 * CAP
+
+
+# ==================== 分数带位策略 × 回测引擎 ====================
+
+def cum_shares(trades, sym):
+    """{成交日: 该票当日收盘时的累计股数}。"""
+    out, t = {}, 0
+    rows = trades[trades["symbol"] == sym].sort_values("date")
+    for _, r in rows.iterrows():
+        t += r["shares"] if r["side"] == "buy" else -r["shares"]
+        out[r["date"]] = t
+    return out
+
+
+def test_policy_ramps_to_the_cap_then_stops_trading():
+    """建仓 5% → 补两档到 15% → 顶到 16% 上限 → 分数不变就彻底不动。
+
+    这里钉的是"同一档只触发一次":如果缩量/挡单被判成已成交,参考分数会假
+    推进、仓位停在半档;如果未成交不推进状态,第 4 轮还会再买一次。
+    """
+    a = "600001"
+    data = {a: daily_frame(flat(10.0))}
+    scores = {d: {a: 0.02 if i == 0 else 0.05} for i, d in enumerate(REBAL)}
+    res = run_bt(scores, data, policy=PolicyConfig(min_trade_value=5000))
+    cum = cum_shares(res["trades"], a)
+    assert list(cum) == EXEC_DAYS[:3], cum            # 最后一次评估没有成交
+    assert cum[EXEC_DAYS[0]] == 5000                  # 建仓线 → 5%
+    assert 14900 <= cum[EXEC_DAYS[1]] <= 15000        # 两档补仓 → 15%
+    assert 15900 <= cum[EXEC_DAYS[2]] <= 16000        # 压到单票上限 16%
+    st = res["policy_states"][a]
+    assert (st.entry_score, st.adds) == (0.02, 2)
+    # 第 3 轮只走掉一档的量(15%→16% 被单票上限截断),但档位按请求的 2 档一起
+    # 结清:仓位已经贴顶,把没吃到上限的那一档留着记账只会让它每轮重复挂单。
+    assert st.ref_score == pytest.approx(0.04)
+    assert res["execution"]["policy_actions"] == {"entry": 1, "add": 2}
+
+
+def test_policy_blocked_entry_retries_every_round():
+    """涨停买不进 → 状态不落地、不留"已建仓"的假记录,下一轮继续重试。"""
+    a, b = "600001", "600002"
+    data = {a: daily_frame(flat(10.0)),
+            b: daily_frame(flat(10.0), chgs=flag_on_exec_days(10.0))}
+    scores = {d: {a: 0.02, b: 0.02} for d in REBAL}
+    res = run_bt(scores, data, policy=PolicyConfig())
+    tr = res["trades"]
+    assert (tr["symbol"] == b).sum() == 0
+    assert b not in res["policy_states"] and a in res["policy_states"]
+    assert res["execution"]["blocked_buy"]["涨停 +10.00%"] == len(EXEC_DAYS)
+
+
+def test_policy_entry_budget_is_fee_aware_and_capped():
+    """20 个高分候选:含费预算只放得下 11 只,总仓位不越 95%,之后不再换手。"""
+    names = [f"6000{i:02d}" for i in range(20)]
+    data = {s: daily_frame(flat(10.0)) for s in names}
+    scores = {d: {s: 0.05 for s in names} for d in REBAL}
+    res = run_bt(scores, data, policy=PolicyConfig())
+    ex = res["execution"]
+    assert ex["policy_actions"] == {"entry": 11}       # 0.88 含费,第 12 挤不进
+    assert ex["policy_final_names"] == 11
+    m = res["marks"]
+    assert (m["market_value"] / m["total_value"]).max() < 0.96
+    assert 0.85 < ex["policy_mean_gross_weight"] < 0.90
+    # 第 2 轮起分数没变 → 一分钱都不该再动(补仓预留额度没被吃掉也不会乱补)
+    assert set(res["trades"]["date"]) == {EXEC_DAYS[0]}
+
+
+def test_policy_exit_below_the_sell_line_clears_the_state():
+    a = "600001"
+    data = {a: daily_frame(flat(10.0))}
+    scores = {REBAL[0]: {a: 0.03}, REBAL[1]: {a: -0.01},
+              REBAL[2]: {a: -0.01}}
+    res = run_bt(scores, data, policy=PolicyConfig())
+    tr = res["trades"]
+    assert cum_shares(tr, a)[EXEC_DAYS[1]] == 0        # 跌破清仓线 → 全清
+    assert res["policy_states"] == {}                  # 真止损,不锁价格
+    assert res["execution"]["policy_actions"] == {"entry": 1, "exit": 1}
+    assert float(res["marks"]["market_value"].iloc[-1]) == pytest.approx(0.0)
+
+
+def test_live_and_backtest_issue_the_same_policy_orders():
+    """两端一致(策略版):同一份分数/持仓/现金/价格 → 同一张指令单。
+
+    回测引擎消费 position_policy.plan 的 Plan,实盘消费 plan_orders 包住的同一个
+    Plan。这条测试钉的就是这个接缝不会分叉。
+    """
+    from live.orders import plan_orders
+    from utils.position_policy import NameState, PolicyConfig
+    from utils.position_policy import plan as policy_plan
+
+    pc = PolicyConfig()
+    scores = {"600001": 0.05, "600002": 0.02}     # 补两档 / 刚过建仓线
+    prices = {"600001": 10.0, "600002": 10.0}
+    states = {"600001": NameState(entry_score=0.03, ref_score=0.03, step=0.01)}
+    held = {"600001": 5000}
+
+    class P:
+        def __init__(self, shares):
+            self.shares, self.available_shares = shares, shares
+            self.market_price = 10.0
+
+    live_orders, pol = plan_orders(scores, {"600001": P(5000)}, 950_000.0,
+                                   prices, dict(states), pc, asof=DATES[0])
+    bt = policy_plan(scores, held, prices, dict(states), 1_000_000.0, pc,
+                     asof=DATES[0])
+    assert {o.symbol: o.quantity for o in live_orders
+            if o.side == "buy"} == bt.plan.buys == {"600001": 10000,
+                                                     "600002": 5000}
+    assert not [o for o in live_orders if o.side == "sell"] and not bt.plan.sells
+    assert set(pol.intents) == set(bt.intents) == {"600001", "600002"}
+
+
+def test_policy_state_commits_only_after_a_real_fill(tmp_path):
+    """跌停卖不掉 → 状态不推进;次日成交后按**实际成交价**记减仓价。"""
+    from live.orders import plan_orders
+    from live.simulate_broker import Position, SimulateBroker
+    from utils.position_policy import NameState, PolicyConfig, apply_fills
+
+    pc = PolicyConfig()
+    states = {"600001": NameState(entry_score=0.03, ref_score=0.03, step=0.01)}
+    br = SimulateBroker(initial_cash=850_000.0, lot_size=100, t_plus_1=True,
+                        state_path=str(tmp_path / "simulate_state.json"))
+    br.positions["600001"] = Position(symbol="600001", shares=15000,
+                                      available_shares=15000, avg_cost=10.0,
+                                      market_price=10.0)
+    d1, d2 = DATES[0], DATES[1]
+    orders, pol = plan_orders({"600001": 0.01}, br.positions_dict(),
+                              br.get_cash(), {"600001": 10.0}, states, pc,
+                              asof=d1)
+    assert [(o.side, o.quantity) for o in orders] == [("sell", 10000)]
+    before = {"600001": 15000}
+    for o in orders:
+        br.place_order(o)
+
+    def bar(o, down):
+        return {"600001": {"open": o, "high": o + 0.2, "low": o - 0.2,
+                           "close": o, "volume": 1e6, "at_limit_up": False,
+                           "at_limit_down": down}}
+
+    assert br.process_daily(d1, bar(9.0, True)) == []       # 跌停卖不掉
+    rep = apply_fills(states, pol.intents, before,
+                      {s: p.shares for s, p in br.positions.items()}, {},
+                      asof=d1)
+    assert "未足量成交" in rep["600001"]
+    assert (states["600001"].ref_score, states["600001"].trim_price) == (0.03, None)
+
+    filled = br.process_daily(d2, bar(9.6, False))
+    assert [(f.filled_quantity, f.filled_price) for f in filled] == [(10000, 9.6)]
+    apply_fills(states, pol.intents, before,
+                {s: p.shares for s, p in br.positions.items()},
+                {"600001": 9.6}, asof=d2)
+    st = states["600001"]
+    assert st.ref_score == pytest.approx(0.01)               # 两档一起结清
+    assert (st.trim_price, st.trim_date) == (9.6, str(d2.date()))

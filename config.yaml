@@ -66,9 +66,40 @@ market:
 backtest:
   initial_capital: 1000000    # 初始资金 100万
   rebalance_frequency: "monthly"  # daily / weekly / monthly
-  max_positions: 50           # 最大持仓数
+                                  # 策略模式下这就是补仓/减仓的评估节奏
+  max_positions: 50           # 最大持仓数(策略模式下由 position_policy.max_names 接管)
   position_sizing: "equal_weight"  # equal_weight / signal_strength
   benchmark: "000852"         # 基准指数(中证1000)
+
+# --- 仓位管理策略(分数带位:建仓 → 补仓 → 减仓 → 清仓) ---
+# 打开后,回测与实盘走同一份 utils/position_policy.py 状态机:
+#   分数 ≥ buy_score 才建仓(给 base_weight 仓位,涨到 strong_score 线性加到
+#   max_entry_weight);每只票建仓那一刻把档位冻成 Δ = 建仓分数 − buy_score
+#   (不小于 step_score_floor);分数比上次动作的参考分数高出 n·Δ 就补一档,
+#   低出 n·Δ 就减一档;单票补到 max_position_weight 就封死,跌破 sell_score
+#   直接清仓。减仓成交价之上有 TTL 天的禁止补仓/重建(见 utils 里的说明)。
+# ⚠ 三个分数阈值必须按 predictions.parquet 的实际分数分布定:regressor 的分数
+#   是"未来 20 个交易日的收益率"(小数,常见 ±0.15,而且经常整片为负),
+#   classifier 的分数是无界 logit —— 换模型类型时这几个数必须重定。
+#   用 python main.py predict 把分数摊开看一眼再填。
+position_policy:
+  enabled: false              # false = 沿用 Top-K 等权(已有回测数字不变)
+  buy_score: 0.02             # 建仓线:低于它不建仓
+  sell_score: 0.0             # 清仓线:低于它无条件清仓(不补、不锁价格)
+  strong_score: 0.05          # 分数高到这儿就给满 max_entry_weight 仓
+  step_score_floor: 0.005     # 一档的最小分数步长(防"建仓即触发补仓")
+  step_multiplier: 1.0        # Δ = multiplier × (建仓分数 − 建仓线)
+  base_weight: 0.05           # 建仓基准仓位(占总资产)
+  max_entry_weight: 0.08      # 分数很高时的建仓上限
+  max_position_weight: 0.16   # 补仓后的单票上限
+  min_hold_weight: 0.025      # 减仓后的最低仓位,低于它改为清仓(不留碎仓)
+  add_step_weight: 0.05       # 补一档加的仓位
+  trim_step_weight: 0.05      # 减一档降的仓位
+  max_steps_per_eval: 2       # 一次评估最多补/减几档(防单日跳档)
+  min_trade_value: 10000      # 单笔补/减的最小名义额(清仓不受限)
+  max_names: 12               # 同时在市股票数上限
+  add_reserve_weight: 0.05    # 给后续补仓留的额度,新仓不许吃光
+  trim_price_ttl_days: 60     # "减仓价之上禁止补仓"的有效期(自然日)
 
 # --- 预测(实盘信号生成) ---
 predict:

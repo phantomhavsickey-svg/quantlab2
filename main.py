@@ -145,14 +145,26 @@ def cmd_backtest(args):
                             columns=EXEC_DAILY_COLS)
 
     # 生成信号(信号日已停牌/无成交的股票不占 Top-K 名额)
-    from models.predictor import signals_from_predictions
+    from models.predictor import signals_from_predictions, scores_from_predictions
+    from utils.position_policy import policy_from_config
     predictions = preds.set_index(["date", "symbol"])["prediction"]
     signal_dates = predictions.index.get_level_values("date").unique()
-    signals = signals_from_predictions(
-        predictions,
-        top_k=config["backtest"]["max_positions"],
-        position_sizing=config["backtest"]["position_sizing"],
-        tradable=build_tradable_mask(daily, signal_dates))
+    tradable = build_tradable_mask(daily, signal_dates)
+    policy = policy_from_config(config)
+    if policy is None:
+        signals = signals_from_predictions(
+            predictions,
+            top_k=config["backtest"]["max_positions"],
+            position_sizing=config["backtest"]["position_sizing"],
+            tradable=tradable)
+    else:
+        # 策略要的是全截面分数;评估频率就是它的补/减仓节奏
+        if config["backtest"]["rebalance_frequency"] == "monthly":
+            logger.warning(
+                "position_policy 已启用但 backtest.rebalance_frequency=monthly:"
+                "月末才评估会把月内的补仓/减仓档位全丢掉,单票 16% 上限也只能"
+                "月末才压得住。建议改成 daily 或 weekly 再对比结果")
+        signals = scores_from_predictions(predictions, tradable=tradable)
 
     # 基准指数(akshare 不可用时回退到股票池等权基准)
     from data.loader import load_benchmark, build_universe_benchmark
@@ -175,7 +187,9 @@ def cmd_backtest(args):
         max_positions=config["backtest"]["max_positions"],
         cost_model=TransactionCostModel(
             mkt["commission_rate"], mkt["min_commission"],
-            mkt["stamp_tax_rate"], mkt["slippage_rate"]))
+            mkt["stamp_tax_rate"], mkt["slippage_rate"]),
+        lot_size=int(mkt.get("lot_size", 100)),
+        policy=policy)
     result = engine.run(daily, signals, bm)
 
     if not result:
@@ -240,19 +254,33 @@ def cmd_predict(args):
     asof = args.asof or datetime.now().strftime("%Y-%m-%d")
     predictions = predictor.predict_asof(asof)
     # 信号日已停牌/无成交的股票不占 Top-K 名额
-    signals = predictor.generate_signals(
-        predictions=predictions,
-        tradable=build_tradable_mask(
-            daily, predictions.index.get_level_values("date").unique()))
+    tradable = build_tradable_mask(
+        daily, predictions.index.get_level_values("date").unique())
+    from models.predictor import scores_from_predictions
+    from utils.position_policy import policy_from_config
+    policy = policy_from_config(config)
+    if policy is None:
+        signals = predictor.generate_signals(predictions=predictions,
+                                             tradable=tradable)
+        holding = signals[signals["weight"] > 0].reset_index()
+    else:
+        # 策略模式下"该买谁"不是一个 Top-K 名单,而是分数 + 现有持仓 + 状态
+        # 的函数;predict 只负责把过建仓线的分数摊开给人看/校准,
+        # 真正的建仓·补仓·减仓指令由 python main.py live 出。
+        scores = scores_from_predictions(predictions, tradable=tradable)
+        holding = scores[scores["score"] >= policy.buy_score].reset_index()
+        logger.info(f"策略模式: 建仓线 {policy.buy_score:.4f} 以上 "
+                    f"{len(holding)} 只(全截面 {len(scores)} 只);"
+                    f"实际指令请跑 python main.py live")
 
     # 输出持仓信号 CSV
     out_dir = config["predict"]["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
-    holding = signals[signals["weight"] > 0].reset_index()
     out = os.path.join(out_dir, f"signals_{datetime.now().strftime('%Y%m%d')}.csv")
     holding.to_csv(out, index=False, encoding="utf-8-sig")
     logger.info(f"持仓信号已输出: {out} ({len(holding)} 只)")
-    print(holding[["symbol", "score", "rank", "weight"]].to_string())
+    cols = ["symbol", "score", "rank"]
+    print(holding[cols + ([] if policy else ["weight"])].head(60).to_string())
 
 
 # ==================== live ====================

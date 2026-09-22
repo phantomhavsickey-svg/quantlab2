@@ -113,6 +113,47 @@ def signals_from_predictions(predictions: pd.Series, top_k: int,
     return signals
 
 
+def scores_from_predictions(predictions: pd.Series,
+                            tradable: pd.Series | None = None) -> pd.DataFrame:
+    """全截面分数(分数带位策略的输入):不截 Top-K、不给等权权重。
+
+    为什么不能直接用 signals_from_predictions 的 score 列:那条路径的 tradable
+    门控只作用在 weight 上,而策略读的是分数 —— 拿全截面 score 列就等于把
+    "信号日没有成交就不许建仓"这道门整个绕开。
+
+    已持仓的股票若当天缺席(停牌/无预测),策略会判成"本轮不碰"而不是清仓,
+    所以这里摘掉分数是安全的。
+
+    Returns:
+        DataFrame MultiIndex (date, symbol),列 [score, rank, weight];
+        weight 恒为 0.0(策略模式下不参与下单,只为让两端 schema 对得上)
+    """
+    if len(predictions) == 0:
+        logger.warning("预测为空,无法生成策略分数")
+        return pd.DataFrame(columns=["score", "rank", "weight"],
+                            index=pd.MultiIndex.from_arrays(
+                                [[], []], names=["date", "symbol"]))
+
+    predictions = predictions.copy()
+    predictions.index = _normalize_multiindex(predictions.index)
+    n0 = len(predictions)
+    if tradable is not None and isinstance(tradable.index, pd.MultiIndex):
+        tradable = tradable.copy()
+        tradable.index = _normalize_multiindex(tradable.index)
+        predictions = predictions[predictions.index.isin(
+            tradable[tradable].index)]
+
+    out = pd.DataFrame({
+        "score": predictions,
+        "rank": predictions.groupby(level="date").rank(ascending=False),
+    })
+    out["weight"] = 0.0
+    logger.info(f"策略分数生成完毕: {len(out):,} 条全截面分数,"
+                f" 门控摘掉 {n0 - len(out)} 条(信号日无成交),"
+                f" 覆盖 {out.index.get_level_values('date').nunique()} 个交易日")
+    return out
+
+
 class TransformerPredictor:
     """Transformer 模型预测器(批量推理 + 信号生成)。"""
 

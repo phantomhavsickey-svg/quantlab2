@@ -24,6 +24,8 @@ from tqdm import tqdm
 from backtest.cost import TransactionCostModel
 from backtest.metrics import PerformanceMetrics
 from utils.market_rules import can_fill, DATE_COL
+from utils.position_policy import (PolicyConfig, apply_fills, plan as policy_plan,
+                                   sync_intent_shares)
 from utils.sizing import rebalance_plan, scale_buys_to_budget
 
 
@@ -43,20 +45,25 @@ class BacktestEngine:
                  rebalance_frequency: str = "monthly",
                  max_positions: int = 30,
                  cost_model: TransactionCostModel | None = None,
-                 lot_size: int = 100):
+                 lot_size: int = 100,
+                 policy: PolicyConfig | None = None):
         """
         Args:
             initial_capital: 初始资金
             rebalance_frequency: 调仓频率 daily/weekly/monthly
-            max_positions: 最大持仓数(信号端已按 Top-K 截断,此处仅记录)
+                分数带位策略下这是**策略评估频率**(补仓/减仓的触发节奏)
+            max_positions: 最大持仓数(信号端已按 Top-K 截断,此处仅记录;
+                策略模式下由 policy.max_names 管住新仓,该值不生效)
             cost_model: 交易成本模型
             lot_size: 一手股数
+            policy: PolicyConfig → 用分数带位建仓/补仓/减仓;None = 等权 Top-K
         """
         self.initial_capital = initial_capital
         self.rebalance_frequency = rebalance_frequency
         self.max_positions = max_positions
         self.lot_size = lot_size
         self.cost = cost_model or TransactionCostModel()
+        self.policy = policy
         self.metrics = PerformanceMetrics()
 
     # ==================== 主回测循环 ====================
@@ -86,6 +93,17 @@ class BacktestEngine:
         logger.info(f"开始回测: 初始资金={self.initial_capital:,.0f}, "
                      f"持仓上限={self.max_positions}, "
                      f"调仓频率={self.rebalance_frequency}")
+        if self.policy is not None:
+            if "score" not in signals.columns:
+                raise ValueError("分数带位策略需要 signals 带 score 列"
+                                 "(用 scores_from_predictions 生成全截面分数)")
+            logger.info(f"仓位策略已启用: 建仓线 {self.policy.buy_score:.4f} / "
+                        f"清仓线 {self.policy.sell_score:.4f} / "
+                        f"{self.policy.base_weight:.0%}→"
+                        f"{self.policy.max_entry_weight:.0%} 建仓, "
+                        f"单票上限 {self.policy.max_position_weight:.0%}, "
+                        f"新仓上限 {self.policy.max_names} 只, "
+                        f"评估频率 {self.rebalance_frequency}")
 
         # 价格面板 + 按日期预索引(旧实现在每个交易日里反复 set_index)
         px = self._index_by_date(data_dict)
@@ -107,8 +125,11 @@ class BacktestEngine:
         # 初始化
         cash = float(self.initial_capital)
         positions = {}        # {symbol: shares}
-        entry_date = {}       # {symbol: 建仓交易日} —— T+1 与持有期统计用
+        entry_date = {}       # {symbol: 建仓交易日} —— 持有期统计用
+        locked = {}           # {symbol: 当日买入股数} —— T+1 按股份而不是按票
+        last_exec = None      # 上一次撮合日,用于跨日解锁 locked
         last_price = {}       # {symbol: 最近有效收盘} —— 缺行估值兜底
+        states = {}           # {symbol: NameState} —— 分数带位策略状态
         equity_curve = []     # [(date, total_value)]
         all_trades = []       # 记录每笔成交
         all_positions = []    # 每日持仓快照
@@ -123,6 +144,9 @@ class BacktestEngine:
         hold_days = []
         turnover = []
         idle_cash = []
+        policy_actions = Counter()
+        policy_gross = []
+        policy_names = []
 
         # 主循环：每个调仓日
         for rebal_date in tqdm(rebalance_dates, desc="回测进行中"):
@@ -134,12 +158,21 @@ class BacktestEngine:
 
             ws = day_signals[day_signals["weight"] > 0]["weight"]
             weights = {str(s): float(v) for s, v in ws.items()}
+            # 策略模式要的是**全截面分数**(signals 的 score 列):Top-K 之外的名字
+            # 可能是"分数过建仓线"的候选,已持仓的名字更不该因为掉出 Top-K 而丢掉
+            # 分数 —— 那会被误当成"分数跌破清仓线"。
+            scores = ({str(s): float(v)
+                       for s, v in day_signals["score"].items()
+                       if pd.notna(v)} if self.policy is not None else {})
 
             # --- Step 2: 找到下一个交易日（成交日） ---
             exec_date = self._next_date(all_dates, rebal_date)
             if exec_date is None or exec_date not in date_pos:
                 continue
             ei = date_pos[exec_date]
+            if exec_date != last_exec:       # 跨日解锁:昨日买入今日可卖
+                locked.clear()
+                last_exec = exec_date
 
             # --- Step 3: 先把 [cursor, ei) 用"这段时间实际持有的组合"盯市 ---
             # (修复:旧实现先更新持仓再回补上一区间,等于用下个月的组合给
@@ -151,7 +184,10 @@ class BacktestEngine:
             cursor = ei
 
             # --- Step 4: 撮合价与可成交性(全部取自 exec_date 当日 bar) ---
-            universe = set(weights) | set(positions)
+            # 建仓候选只需覆盖"分数过建仓线"的名字,全截面里低分名字不必取 bar
+            cands = (set(weights) if self.policy is None else
+                     {s for s, x in scores.items() if x >= self.policy.buy_score})
+            universe = cands | set(positions)
             rows = {s: self._row(px, s, exec_date) for s in universe}
             for s in universe:
                 cp = self._close_of(rows[s])
@@ -168,16 +204,34 @@ class BacktestEngine:
                                 for s, q in positions.items())
 
             # --- Step 5: 目标市值 - 现有市值 → 买卖差额(与实盘同一份数学) ---
-            plan = rebalance_plan(weights, positions, prices, equity,
-                                  lot_size=self.lot_size)
+            pol = None
+            if self.policy is None:
+                plan = rebalance_plan(weights, positions, prices, equity,
+                                      lot_size=self.lot_size)
+            else:
+                pol = policy_plan(scores, positions, prices, states, equity,
+                                  self.policy, lot_size=self.lot_size,
+                                  asof=exec_date)
+                plan = pol.plan
+                for k, v in pol.actions.items():
+                    policy_actions[k] += v
+                if pol.gross_weight > 0:
+                    policy_gross.append(pol.gross_weight)
+                for s, why in pol.notes.items():
+                    logger.debug(f"未动作 {exec_date.date()} {s}: {why}")
+
+            before = dict(positions)
+            fill_price = {}
 
             # --- Step 6: 卖出(先卖后买;跌停/停牌/T+1 挡下的留在持仓里) ---
             for sym in sorted(plan.sells):
-                qty = min(plan.sells[sym], positions.get(sym, 0))
-                if qty <= 0:
+                avail = positions.get(sym, 0) - locked.get(sym, 0)
+                if avail <= 0:
+                    if positions.get(sym, 0) > 0:
+                        blocked_sell["T+1 当日买入"] += 1
                     continue
-                if entry_date.get(sym) == exec_date:
-                    blocked_sell["T+1 当日买入"] += 1
+                qty = min(plan.sells[sym], avail)
+                if qty <= 0:
                     continue
                 ok, why = can_fill(rows.get(sym), sym, "sell")
                 if not ok:
@@ -187,6 +241,7 @@ class BacktestEngine:
                 amount = sell_price * qty
                 cost = self.cost.total_cost(amount, "sell")
                 cash += amount - cost
+                fill_price[sym] = sell_price
                 if entry_date.get(sym) is not None:
                     hold_days.append(self._holding_days(
                         date_pos, entry_date[sym], exec_date))
@@ -211,6 +266,9 @@ class BacktestEngine:
             scale_buys_to_budget(plan, cash, prices, lot_size=self.lot_size,
                                  fee_rate_buy=self.cost.effective_cost_rate(
                                      "buy"))
+            if pol is not None:
+                # 现金缩量是"这一档只能买到这么多",按缩量后的股数推进状态
+                sync_intent_shares(pol.intents, plan)
             traded = 0.0
             for sym in sorted(plan.buys):
                 shares = plan.buys[sym]
@@ -227,6 +285,8 @@ class BacktestEngine:
 
                 cash -= amount + cost
                 positions[sym] = positions.get(sym, 0) + shares
+                locked[sym] = locked.get(sym, 0) + shares   # T+1:今日买入不可卖
+                fill_price[sym] = buy_price
                 entry_date.setdefault(sym, exec_date)
                 traded += amount
 
@@ -248,6 +308,16 @@ class BacktestEngine:
             if equity > 0 and invested / equity < 0.98:
                 idle_cash.append(cash)
             started = True
+
+            # --- Step 7.5: 按**实际股数变化**提交策略状态 ---
+            # 涨停挡买、跌停挡卖、T+1 挡卖、现金缩量掉的部分都不推进参考分数,
+            # 下一轮同一档条件仍然成立 → 自动补做,不会出现"钱花了仓位没记上"。
+            if pol is not None:
+                for s, msg in apply_fills(states, pol.intents, before,
+                                          positions, fill_price,
+                                          asof=exec_date).items():
+                    logger.debug(f"策略状态 {exec_date.date()} {s}: {msg}")
+                policy_names.append(len(positions))
 
             # --- Step 8: 成交日当天用撮合后的新组合盯市 ---
             self._mark_day(exec_date, positions, last_price, px, cash,
@@ -311,6 +381,14 @@ class BacktestEngine:
             "mean_idle_cash": float(np.mean(idle_cash)) if idle_cash else 0.0,
             "final_cash": float(cash),
         }
+        if self.policy is not None:
+            # 策略诊断:动作构成、实际用掉的仓位、持仓只数
+            execution["policy_actions"] = dict(policy_actions)
+            execution["policy_mean_gross_weight"] = (
+                float(np.mean(policy_gross)) if policy_gross else float("nan"))
+            execution["policy_mean_names"] = (
+                float(np.mean(policy_names)) if policy_names else 0.0)
+            execution["policy_final_names"] = len(positions)
 
         # 打印结果
         self._print_summary(perf, execution)
@@ -324,6 +402,7 @@ class BacktestEngine:
             "metrics": perf,
             "benchmark_curve": bm_curve,
             "execution": execution,
+            "policy_states": dict(states),
         }
 
     # ==================== 盯市 ====================
@@ -459,4 +538,9 @@ class BacktestEngine:
             print(f"  欠配调仓次数: {execution['n_underinvested_rebalances']},"
                   f" 该些次平均滞留现金 "
                   f"{execution['mean_idle_cash']:,.0f} 元")
+            if "policy_actions" in execution:
+                print(f"  策略动作: {execution['policy_actions']}")
+                print(f"  平均目标仓位: {execution['policy_mean_gross_weight']*100:.1f}%,"
+                      f" 平均持仓 {execution['policy_mean_names']:.1f} 只,"
+                      f" 期末 {execution['policy_final_names']} 只")
         print("=" * 60 + "\n")

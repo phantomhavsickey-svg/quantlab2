@@ -30,48 +30,72 @@ class Plan:
 
 
 def _lot(qty: int, lot_size: int) -> int:
-    return (int(qty) // lot_size) * lot_size
+    """向下取整到整手,带一个相对容差。
+
+    0.15 − 0.10 这类浮点误差会得到 4999.999999999999,直接截断就少掉一手,
+    在仓位边界上把目标仓位莫名缩掉一档(补/减仓每档就是 5% 这种整数比例)。
+    """
+    q = float(qty)
+    if q >= 0:
+        q += max(abs(q), 1.0) * 1e-12
+    return (int(q) // lot_size) * lot_size
 
 
 def rebalance_plan(weights: dict, held: dict, prices: dict,
                    total_value: float, *, lot_size: int = 100,
                    max_total_pct: float = 1.0,
                    fee_rate_buy: float = 0.0,
-                   fee_rate_sell: float = 0.0) -> Plan:
+                   fee_rate_sell: float = 0.0,
+                   normalize: bool = True,
+                   keep=None) -> Plan:
     """按目标市值与现有市值的差额生成买卖量。
 
     Args:
-        weights: {symbol: 目标权重},权重 > 0 即应持有;缺席即应清仓
+        weights: {symbol: 目标权重},权重 > 0 即应持有;缺席或 ≤0 即应清仓
         held: {symbol: 当前股数}
         prices: {symbol: 成交价}(回测传次日开盘价,实盘传实时价)。
                 缺价的股票保持原持仓不动 —— 没有价格就没法下单
         total_value: 调仓时点总资产(现金 + 持仓市值),按同一价格基准
         lot_size: 一手股数
         max_total_pct: 投资总额上限(0.95 = 留 5% 现金缓冲)
-        fee_rate_buy / fee_rate_sell: 单边费率,仅用于买入预算的可行性缩放
-
+        fee_rate_buy / fee_rate_sell: 单边费率。**当前未被使用**,预算可行性
+                缩放只在 scale_buys_to_budget 里按 fee_rate_buy 算
+        normalize: True(默认)= 权重按**比例**分配,Σ权重会被归一化到
+                investable,等权时等价于 1/N —— 旧口径。
+                False = 权重就是**占总资产的绝对比例**,5% 就是 5%,缺席的额度
+                留成现金不 realloc。分数带位策略必须用 False,否则"目标仓位"
+                这个概念会被归一化掉了。
+        keep: 本轮即便算得出差额也不下单的股票集合(策略里"带内不动"的名字;
+              既不会被减仓也不会被清仓)
     Returns:
         Plan
     """
-    held = {s: int(q) for s, q in held.items() if int(q) > 0}
+    held = {str(s): int(q) for s, q in held.items() if int(q) > 0}
+    keep = {str(s) for s in (keep or ())}
     w = {str(s): float(v) for s, v in weights.items()
          if v is not None and float(v) > 0}
-    # 只对有价格的名字分配权重;无价名字保留现有持仓,不参与再分配
-    priced = {s: v for s, v in w.items() if _valid_price(prices, s)}
-    sw = sum(priced.values())
+    # 只在"有价格 + 不在 keep 里"的名字之间分配权重;其余保持原持仓不动
+    alloc = {s: v for s, v in w.items()
+             if _valid_price(prices, s) and s not in keep}
+    sw = sum(alloc.values())
     plan = Plan()
-    if sw <= 0 or total_value <= 0:
+    if total_value <= 0 or (normalize and sw <= 0):
         plan.sells = {}
         plan.buys = {}
         return plan
 
     investable = total_value * min(max(max_total_pct, 0.0), 1.0)
     tgt = {}
-    for s, v in priced.items():
-        tgt[s] = _lot(investable * (v / sw) / float(prices[s]), lot_size)
-    # 目标集合里缺席、但有价格的名字 → 清仓
+    for s, v in alloc.items():
+        frac = (v / sw) if normalize else v
+        tgt[s] = _lot(investable * frac / float(prices[s]), lot_size)
+    # keep 的名字:目标锁在当前股数,不产生买卖差额
+    for s in keep:
+        if s in held and _valid_price(prices, s):
+            tgt[s] = held[s]
+    # 目标集合里缺席、且有价格、也没被 keep 的名字 → 清仓
     for s, q in held.items():
-        if s not in w and _valid_price(prices, s):
+        if s not in w and s not in keep and _valid_price(prices, s):
             tgt[s] = 0
     plan.target_shares = tgt
 

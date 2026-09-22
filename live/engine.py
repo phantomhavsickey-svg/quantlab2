@@ -5,10 +5,13 @@
     启动(交易日盘中前台运行,或 --once 单次执行):
     ├─ 加载最新 checkpoint + SequenceStore + 预测器
     ├─ 主循环(每 poll_interval 秒):
-    │    ├─ 拉取 持仓 ∪ 目标 股票实时行情
+    │    ├─ 拉取 持仓 ∪ 候选 股票实时行情
     │    ├─ 到调仓时间(默认 09:35)且今日是调仓日(默认月末)且今日未调仓:
-    │    │    信号(因子截止上一交易日,lag-1 口径) → 目标权重
-    │    │    → make_orders → 风控过滤 → 按后端执行
+    │    │    信号(因子截止上一交易日,lag-1 口径)
+    │    │    ├─ 等权模式: Top-K → 目标权重 → make_orders
+    │    │    └─ position_policy.enabled: 全截面分数 → plan_orders
+    │    │         (建仓线/补仓档/单票上限/减仓价,与回测同一份状态机)
+    │    │    → 风控过滤 → 按后端执行 → apply_fills 提交策略状态并落盘
     │    │    simulate: 下单 + 当日 bar 撮合 + 状态落盘
     │    │    qmt:      --confirm 才真实下单,否则仅导出指令 CSV
     │    │    none:     仅导出指令 CSV
@@ -17,6 +20,10 @@
 
 --once 模式:单次完整执行(信号→指令→风控→执行→盯市)后退出,
 任何一天都可运行(测试/计划任务用),不检查调仓日。
+
+策略状态(每只票的建仓分数/参考分数/减仓价)落在
+live/state/policy_state.json,重启后继续按同一档结算 —— 补仓/减仓的触发
+是"相对上一次动作的分数变化",没有状态就等于每轮从零开始。
 """
 
 import os
@@ -29,10 +36,12 @@ from loguru import logger
 
 from live.broker import Broker, OrderSide, OrderStatus
 from live.journal import TradeJournal
-from live.orders import make_orders, export_orders
+from live.orders import export_orders, make_orders, plan_orders
 from live.risk import RiskManager
 from live.__init__ import SinaQuoteFeed, Quote
 from utils.market_rules import at_limit_up, at_limit_down
+from utils.position_policy import (apply_fills, load_states,
+                                   policy_from_config, save_states)
 
 
 def _num(row, col, default=None):
@@ -87,6 +96,22 @@ class LiveEngine:
         mkt = config.get("market", {})
         self.fee_rate_buy = float(mkt.get("commission_rate", 0.0003)) + \
             float(mkt.get("slippage_rate", 0.001))
+
+        # --- 分数带位策略:与回测引擎共用 utils/position_policy ---
+        self.policy = policy_from_config(config)
+        self.policy_enabled = self.policy is not None
+        self.policy_state_path = os.path.join(
+            live_cfg.get("state_dir", "live/state"), "policy_state.json")
+        self.states = load_states(self.policy_state_path) \
+            if self.policy_enabled else {}
+        if self.policy_enabled:
+            logger.info(f"仓位策略已启用: 建仓线 {self.policy.buy_score:.4f} / "
+                        f"清仓线 {self.policy.sell_score:.4f},单票 "
+                        f"{self.policy.base_weight:.0%}→"
+                        f"{self.policy.max_position_weight:.0%},新仓上限 "
+                        f"{self.policy.max_names} 只,总仓位上限 "
+                        f"{self.policy.max_total_pct:.0%};已恢复 "
+                        f"{len(self.states)} 只持仓的策略状态")
 
         self._load_model()
         self.done_rebalance_today = False
@@ -161,11 +186,45 @@ class LiveEngine:
                     f"目标 {len(weights)} 只, Top-K={self.top_k}")
         return weights
 
+    def _policy_scores(self, ref_date: pd.Timestamp) -> dict[str, float]:
+        """生成**全截面**分数 {symbol → score}(策略要的是分数,不是 Top-K)。
+
+        口径与等权路径一致:因子截止上一交易日收盘(无未来函数),信号日没有
+        成交的股票直接摘掉 —— 不建仓也不因"分数消失"被误清仓(那只在回测里
+        同样是缺席,由 keep 兜住)。
+        """
+        asof = self._signal_asof(ref_date)
+        preds = self.predictor.predict_asof(asof)
+        self.last_signal_date = preds.index.get_level_values("date")[0]
+        sig_dates = preds.index.get_level_values("date").unique()
+        tradable = build_tradable_mask(self.daily, sig_dates)
+        allowed = set(tradable[tradable].index.get_level_values("symbol"))
+        preds = preds[[s in allowed
+                       for s in preds.index.get_level_values("symbol")]]
+        scores = {str(s): float(x) for s, x in preds.items() if x == x}
+        n_buy = sum(1 for x in scores.values()
+                    if x >= self.policy.buy_score)
+        logger.info(f"策略分数: 因子截至 {self.last_signal_date.date()}, "
+                    f"全截面 {len(scores)} 只,过建仓线 {n_buy} 只")
+        return scores
+
     # ==================== 行情与参考价 ====================
 
     def _watch_symbols(self, target: dict[str, float]) -> list[str]:
-        """行情订阅集合 = 持仓 ∪ 目标。"""
-        syms = set(self.broker.positions_dict().keys()) | set(target.keys())
+        """行情订阅集合 = 持仓 ∪ 候选。
+
+        策略模式下 target 是全截面分数(几千只),逐秒轮询这个集合既打满新浪
+        接口又没必要:进仓按分数降序排队,能真正建仓的最多 max_names 只,取
+        过线的 2×max_names 名就够(剩下的名额本来也进不去)。
+        """
+        syms = {str(s) for s in self.broker.positions_dict().keys()}
+        if self.policy is None:
+            syms |= {str(s) for s in target}
+            return sorted(syms)
+        cand = {str(s): x for s, x in target.items()
+                if x >= self.policy.buy_score}
+        limit = 2 * self.policy.max_names
+        syms |= sorted(cand, key=lambda s: (-cand[s], s))[:limit]
         return sorted(syms)
 
     def _ref_prices(self, quotes: dict[str, Quote],
@@ -232,12 +291,21 @@ class LiveEngine:
         logger.info(f"===== 调仓开始: {trade_date} =====")
 
         # 1. 信号(因子截止上一交易日,与训练 lag-1 口径一致)
-        target = self._target_weights(pd.Timestamp(self.asof))
+        #    基准日 = **本次撮合日**,不是进程启动那天写死的 self.asof —— 盘中
+        #    轮询跨过零点后还拿启动日的因子选股,就是拿两天前的信号下单。
+        ref = pd.Timestamp(trade_date)
+        target = (self._policy_scores(ref) if self.policy_enabled
+                  else self._target_weights(ref))
 
         # 2. 行情 + 参考价
         syms = self._watch_symbols(target)
         quotes = self.feed.fetch(syms)
-        ref_prices = self._ref_prices(quotes, self._fallback_closes())
+        closes = self._fallback_closes()
+        held = {str(s) for s in self.broker.positions_dict().keys()}
+        # 日线兜底价只给持仓用(算市值、卖单要有价):没盯盘的候选拿不到今日价,
+        # 就不该按昨天的收盘价去建仓 —— 缺价的候选由策略判成"本轮不碰"。
+        ref_prices = self._ref_prices(
+            quotes, {s: c for s, c in closes.items() if s in held})
 
         # 3. 指令构造(先卖后买)
         positions = self.broker.positions_dict()
@@ -246,11 +314,22 @@ class LiveEngine:
             # none 模式:用初始资金估算"从零开始"的全新建仓指令
             # (真实券商没有持仓/资金查询,这正是指令文件的用途)
             cash = self.initial_capital
-        orders = make_orders(target, positions, cash, ref_prices,
-                             lot_size=self.config["market"].get(
-                                 "lot_size", 100),
-                             max_total_pct=self.risk.max_total_pct,
-                             fee_rate_buy=self.fee_rate_buy)
+        before = {str(s): int(getattr(p, "shares", 0) or 0)
+                  for s, p in positions.items()}
+        lot = int(self.config["market"].get("lot_size", 100))
+        pol = None
+        if self.policy is None:
+            orders = make_orders(target, positions, cash, ref_prices,
+                                 lot_size=lot,
+                                 max_total_pct=self.risk.max_total_pct,
+                                 fee_rate_buy=self.fee_rate_buy)
+        else:
+            orders, pol = plan_orders(target, positions, cash, ref_prices,
+                                      self.states, self.policy,
+                                      lot_size=lot, asof=trade_date)
+            for s, why in sorted(pol.notes.items()):
+                # "为什么今天没单"必须能从日志里直接回答,而不是让人去猜策略状态
+                logger.debug(f"未动作 {s}: {why}")
 
         # 4. 风控过滤(阻断式)
         total_value = self.broker.get_total_value()
@@ -258,8 +337,9 @@ class LiveEngine:
             orders, total_value=total_value, cash=cash,
             positions=positions, quotes=quotes)
 
-        # 5. 执行
-        snapshot = self._build_market_snapshot(trade_date, quotes, target)
+        # 5. 执行(watch = 本轮真正可能成交的名字:持仓 ∪ 候选)
+        watch = dict.fromkeys(syms, 1.0)
+        snapshot = self._build_market_snapshot(trade_date, quotes, watch)
         is_qmt = self.broker.__class__.__name__ == "QMTBroker"
         filled = []
 
@@ -282,6 +362,17 @@ class LiveEngine:
                 stamp_tax=order.stamp_tax, slippage=order.slippage,
                 trade_date=trade_date)
 
+        # 5.5 策略状态提交:只认**实际股数变化**。风控拦下、券商拒单、部分成交
+        # 都不推进参考分数,下一轮同一档条件仍成立会自动补做(与回测同一提交点)。
+        if pol is not None:
+            after = {str(s): int(getattr(p, "shares", 0) or 0)
+                     for s, p in self.broker.positions_dict().items()}
+            fills = {str(o.symbol): float(o.filled_price) for o in filled}
+            for s, msg in apply_fills(self.states, pol.intents, before,
+                                      after, fills, asof=trade_date).items():
+                logger.debug(f"策略状态 {s}: {msg}")
+            save_states(self.policy_state_path, self.states)
+
         # 导出指令文件(实盘安全模式/none 模式的核心产物)
         if is_qmt and not self.confirm or \
                 self.broker.__class__.__name__ == "NoneBroker":
@@ -291,9 +382,11 @@ class LiveEngine:
                 f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"))
 
         # 6. 盯市 + 快照
-        self._mark_to_market(trade_date, quotes, target)
+        self._mark_to_market(trade_date, quotes, watch)
         self.done_rebalance_today = True
-        logger.info(f"===== 调仓完成: 目标 {len(target)} 只, "
+        n_target = (len(self.states) if self.policy_enabled
+                    else len(self.broker.positions_dict()))
+        logger.info(f"===== 调仓完成: 持仓/在建 {n_target} 只, "
                     f"成交 {len(filled)} 笔 =====")
 
     # ==================== 盯市 ====================
@@ -330,10 +423,14 @@ class LiveEngine:
     def _is_rebalance_day(self, today: pd.Timestamp) -> bool:
         """调仓日判断。
 
+        daily:     每个交易日都评估(分数带位策略的推荐节奏:补仓/减仓的触发
+                   是分数相对变化,等月末会把 20 日窗口内攒出的档位全丢掉)
         month_end: 本月最后一个交易日(基于交易日历,盘中实时判断
                    不依赖因子面板日期,新交易日也能正确识别)
         weekly:    每周五
         """
+        if self.rebalance_day == "daily":
+            return True
         if self.rebalance_day == "weekly":
             return today.weekday() == 4
 

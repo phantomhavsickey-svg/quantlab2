@@ -147,10 +147,12 @@ def cmd_backtest(args):
     # 生成信号(信号日已停牌/无成交的股票不占 Top-K 名额)
     from models.predictor import signals_from_predictions, scores_from_predictions
     from utils.position_policy import policy_from_config
+    from utils.exposure import overlay_from_config
     predictions = preds.set_index(["date", "symbol"])["prediction"]
     signal_dates = predictions.index.get_level_values("date").unique()
     tradable = build_tradable_mask(daily, signal_dates)
     policy = policy_from_config(config)
+    overlay = overlay_from_config(config) if policy is not None else None
     if policy is None:
         signals = signals_from_predictions(
             predictions,
@@ -189,7 +191,8 @@ def cmd_backtest(args):
             mkt["commission_rate"], mkt["min_commission"],
             mkt["stamp_tax_rate"], mkt["slippage_rate"]),
         lot_size=int(mkt.get("lot_size", 100)),
-        policy=policy)
+        policy=policy,
+        overlay=overlay)
     result = engine.run(daily, signals, bm)
 
     if not result:

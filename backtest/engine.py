@@ -24,7 +24,9 @@ from tqdm import tqdm
 from backtest.cost import TransactionCostModel
 from backtest.metrics import PerformanceMetrics
 from utils.market_rules import can_fill, DATE_COL
-from utils.position_policy import (PolicyConfig, apply_fills, plan as policy_plan,
+from utils.exposure import ExposureOverlay, overlay_args
+from utils.position_policy import (PolicyConfig, apply_fills,
+                                   plan as policy_plan,
                                    sync_intent_shares)
 from utils.sizing import rebalance_plan, scale_buys_to_budget
 
@@ -46,7 +48,8 @@ class BacktestEngine:
                  max_positions: int = 30,
                  cost_model: TransactionCostModel | None = None,
                  lot_size: int = 100,
-                 policy: PolicyConfig | None = None):
+                 policy: PolicyConfig | None = None,
+                 overlay=None):
         """
         Args:
             initial_capital: 初始资金
@@ -56,7 +59,9 @@ class BacktestEngine:
                 策略模式下由 policy.max_names 管住新仓,该值不生效)
             cost_model: 交易成本模型
             lot_size: 一手股数
-            policy: PolicyConfig → 用分数带位建仓/补仓/减仓;None = 等权 Top-K
+            policy: PolicyConfig → 分数带位建仓/补仓/减仓;None = 等权 Top-K
+            overlay: utils.exposure.OverlayConfig → 组合级暴露层(目标波动缩放 +
+                运行时 IC 门控),按轮压 policy.max_total_pct;需要 policy 一起开
         """
         self.initial_capital = initial_capital
         self.rebalance_frequency = rebalance_frequency
@@ -64,6 +69,7 @@ class BacktestEngine:
         self.lot_size = lot_size
         self.cost = cost_model or TransactionCostModel()
         self.policy = policy
+        self.overlay = overlay
         self.metrics = PerformanceMetrics()
 
     # ==================== 主回测循环 ====================
@@ -109,6 +115,24 @@ class BacktestEngine:
         px = self._index_by_date(data_dict)
         price_df = self._build_price_panel(data_dict)
 
+        # 组合级暴露层:构造时一次算完全体 RankIC 与全池等权波动,逐调仓日只切片
+        ovl = None
+        if self.overlay is not None:
+            if self.policy is None:
+                logger.warning("exposure_overlay 只挂在分数带位策略上"
+                               "(position_policy 未启用),本轮忽略")
+            elif "score" not in signals.columns:
+                raise ValueError("暴露层的 RankIC 需要 signals 带 score 列")
+            else:
+                ovl = ExposureOverlay(signals, price_df, self.overlay)
+                c = self.overlay
+                logger.info(
+                    f"组合级暴露层已启用: 目标年化波动 {c.vol_target_ann:.0%}"
+                    f"(近 {c.vol_lookback_days} 日全池等权已实现波动,缩放地板 "
+                    f"{c.scale_floor:.2f}) / 近 {c.ic_window_days} 日已兑现 "
+                    f"RankIC 门控({c.ic_horizon_days} 日标签,≥{c.ic_min_obs} "
+                    f"个观测才判,触发时仓位 ×{c.ic_cap_mult:.2f} 且禁新仓)")
+
         # 获取调仓日期（signal 中实际存在的日期）
         signal_dates = sorted(signals.index.get_level_values("date").unique())
 
@@ -147,6 +171,7 @@ class BacktestEngine:
         policy_actions = Counter()
         policy_gross = []
         policy_names = []
+        exposure_rows = []
 
         # 主循环：每个调仓日
         for rebal_date in tqdm(rebalance_dates, desc="回测进行中"):
@@ -205,13 +230,29 @@ class BacktestEngine:
 
             # --- Step 5: 目标市值 - 现有市值 → 买卖差额(与实盘同一份数学) ---
             pol = None
+            ov = None
             if self.policy is None:
                 plan = rebalance_plan(weights, positions, prices, equity,
                                       lot_size=self.lot_size)
             else:
+                # 暴露层按**信号日**收盘及之前的信息判定,成交在次日开盘 → 无前视
+                ov = ovl.at(rebal_date) if ovl is not None else None
+                if ov is not None:
+                    exposure_rows.append({
+                        "date": rebal_date,
+                        "cap": self.policy.max_total_pct * ov.cap_mult,
+                        "cap_mult": ov.cap_mult,
+                        "realized_vol": ov.realized_vol,
+                        "rank_ic": ov.rank_ic,
+                        "n_ic_obs": ov.n_ic_obs,
+                        "gated": ov.gated,
+                    })
+                    if ov.gated or ov.cap_mult < 1.0:
+                        logger.debug(f"暴露层 {rebal_date.date()}: {ov.note()}")
                 pol = policy_plan(scores, positions, prices, states, equity,
                                   self.policy, lot_size=self.lot_size,
-                                  asof=exec_date)
+                                  asof=exec_date,
+                                  **overlay_args(ov, self.policy.max_total_pct))
                 plan = pol.plan
                 for k, v in pol.actions.items():
                     policy_actions[k] += v
@@ -305,7 +346,14 @@ class BacktestEngine:
                 turnover.append(traded / equity)
             invested = sum(q * prices.get(s, last_price.get(s, 0.0))
                            for s, q in positions.items())
-            if equity > 0 and invested / equity < 0.98:
+            # "欠配"要报的是"想投却投不出去",不是设计意图。带暴露层时本轮
+            # 上限可能被压到 45%,再拿 98% 当判据就恒为真,这条诊断就废了。
+            ceiling = 0.98
+            if self.policy is not None:
+                ceiling = self.policy.max_total_pct
+                if ov is not None:
+                    ceiling *= ov.cap_mult
+            if equity > 0 and invested / equity < ceiling - 0.02:
                 idle_cash.append(cash)
             started = True
 
@@ -389,6 +437,15 @@ class BacktestEngine:
             execution["policy_mean_names"] = (
                 float(np.mean(policy_names)) if policy_names else 0.0)
             execution["policy_final_names"] = len(positions)
+        if exposure_rows:
+            er = pd.DataFrame(exposure_rows).set_index("date")
+            execution["exposure"] = er
+            execution["exposure_mean_cap"] = float(er["cap"].mean())
+            execution["exposure_min_cap"] = float(er["cap"].min())
+            execution["n_gated_evals"] = int(er["gated"].sum())
+            execution["mean_realized_vol"] = float(er["realized_vol"].mean())
+            execution["mean_window_ic"] = float(er["rank_ic"].mean())
+            execution["min_window_ic"] = float(er["rank_ic"].min())
 
         # 打印结果
         self._print_summary(perf, execution)
@@ -543,4 +600,16 @@ class BacktestEngine:
                 print(f"  平均目标仓位: {execution['policy_mean_gross_weight']*100:.1f}%,"
                       f" 平均持仓 {execution['policy_mean_names']:.1f} 只,"
                       f" 期末 {execution['policy_final_names']} 只")
+            if "exposure_mean_cap" in execution:
+                er = execution["exposure"]
+                print(f"  暴露层({len(er)} 次评估): 平均仓位上限 "
+                      f"{execution['exposure_mean_cap']*100:.0f}%"
+                      f"(最低 {execution['exposure_min_cap']*100:.0f}%),"
+                      f" 全池已实现波动均值 "
+                      f"{er['realized_vol'].mean()*100:.1f}%")
+                if er["rank_ic"].notna().any():
+                    print(f"  IC 门控: 窗口 RankIC 均值 "
+                          f"{er['rank_ic'].mean():+.4f} / 最低 "
+                          f"{er['rank_ic'].min():+.4f},触发 "
+                          f"{execution['n_gated_evals']}/{len(er)} 次评估")
         print("=" * 60 + "\n")

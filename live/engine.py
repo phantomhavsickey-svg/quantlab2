@@ -40,6 +40,8 @@ from live.orders import export_orders, make_orders, plan_orders
 from live.risk import RiskManager
 from live.__init__ import SinaQuoteFeed, Quote
 from utils.market_rules import at_limit_up, at_limit_down
+from utils.exposure import (ExposureOverlay, close_panel, overlay_args,
+                            overlay_from_config)
 from utils.position_policy import (apply_fills, load_states,
                                    policy_from_config, save_states)
 
@@ -112,6 +114,11 @@ class LiveEngine:
                         f"{self.policy.max_names} 只,总仓位上限 "
                         f"{self.policy.max_total_pct:.0%};已恢复 "
                         f"{len(self.states)} 只持仓的策略状态")
+
+        # --- 组合级暴露层:只在策略模式下挂(等权 Top-K 没有总仓位旋钮可让它压) ---
+        self.overlay_cfg = (overlay_from_config(config)
+                            if self.policy_enabled else None)
+        self._ovl = None            # 延迟到首轮构建:_load_model 才有日线宽表
 
         self._load_model()
         self.done_rebalance_today = False
@@ -207,6 +214,44 @@ class LiveEngine:
         logger.info(f"策略分数: 因子截至 {self.last_signal_date.date()}, "
                     f"全截面 {len(scores)} 只,过建仓线 {n_buy} 只")
         return scores
+
+    def _overlay(self):
+        """组合级暴露层结论(目标波动缩放 + 运行时 IC 门控),按信号基准日取。
+
+        基准日取 `last_signal_date`(因子截止日)而不是"今天":回测里暴露层就在
+        信号日收盘上评估、次日开盘成交,两端必须用同一个 asof,否则实盘会比回测
+        多知道一天的波动。收盘宽表也来自回测同一份日线口径。
+
+        历史分数取 predictions.parquet —— 没有它就判不出滚动 IC,门控会在"观测
+        不足"下恒放行,那等于装了一个不工作的风控,所以直接拒绝出指令。
+        """
+        if self.overlay_cfg is None:
+            return None
+        asof = pd.Timestamp(self.last_signal_date).date()
+        if self._ovl is None:
+            ppath = self.config["data"]["prediction_cache"]
+            if not os.path.exists(ppath):
+                raise SystemExit(
+                    f"exposure_overlay.enabled=true 但 {ppath} 不存在:没有历史分数"
+                    f"就判不出 IC 门控,拒绝在门控失真的情况下出指令")
+            hist = pd.read_parquet(ppath)
+            hist["date"] = pd.to_datetime(hist["date"])
+            stale = (asof - hist["date"].max().date()).days
+            if stale > 45:
+                logger.warning(f"predictions.parquet 最新日期 "
+                               f"{hist['date'].max().date()} 已落后 {stale} 天:"
+                               f"IC 门控会按\"观测不足\"放行,要让它真的在岗请先"
+                               f"重训/补齐预测缓存")
+            self._ovl = ExposureOverlay(
+                hist.set_index(["date", "symbol"])["prediction"],
+                close_panel(self.daily), self.overlay_cfg)
+            logger.info(f"暴露层参数: 目标年化波动 "
+                        f"{self.overlay_cfg.vol_target_ann:.0%} / RankIC 门控 "
+                        f"{self.overlay_cfg.ic_window_days} 日窗")
+        ov = self._ovl.at(self.last_signal_date)
+        logger.info(f"暴露层 @ {asof}: {ov.note()} → 本轮总仓位上限 "
+                    f"{self.policy.max_total_pct * ov.cap_mult:.1%}")
+        return ov
 
     # ==================== 行情与参考价 ====================
 
@@ -324,9 +369,13 @@ class LiveEngine:
                                  max_total_pct=self.risk.max_total_pct,
                                  fee_rate_buy=self.fee_rate_buy)
         else:
+            # 暴露层压的是"这一轮允许用多少仓位 + 还让不让建仓",带位状态机不变
+            ov = self._overlay()
             orders, pol = plan_orders(target, positions, cash, ref_prices,
                                       self.states, self.policy,
-                                      lot_size=lot, asof=trade_date)
+                                      lot_size=lot, asof=trade_date,
+                                      **overlay_args(ov,
+                                                    self.policy.max_total_pct))
             for s, why in sorted(pol.notes.items()):
                 # "为什么今天没单"必须能从日志里直接回答,而不是让人去猜策略状态
                 logger.debug(f"未动作 {s}: {why}")

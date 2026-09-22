@@ -23,6 +23,11 @@
 **单子没成交就不推进状态**:最小交易额不够、预算不够、涨停/跌停/停牌没成交、
 只部分成交,一律保留原参考分数。下一轮条件仍然成立,会自动补足差额。否则会出现
 "分数已经用掉了但仓位没变"这种单向漏掉的坑。
+
+上面四条带只管**单票**。组合级"总共敢下多少注"由 utils/exposure.py 按轮给一个
+`max_total_pct_override`:上限低于当前仓位时等比降杠杆(de_gross 动作,不推进
+分数状态、不留减仓价),门控触发时补仓与新仓一并挂起 —— 降杠杆那一轮再把回笼的
+钱花出去等于没降。
 """
 
 from __future__ import annotations
@@ -191,7 +196,7 @@ class NameState:
 @dataclass
 class Intent:
     """一次"想动"的提议。只有对应订单**足量成交**后才写回 NameState。"""
-    kind: str            # entry / add / trim / cap / exit / exit_by_trim
+    kind: str            # entry / add / trim / cap / exit / exit_by_trim / de_gross
     symbol: str
     weight: float = 0.0          # 目标权重
     delta_value: float = 0.0     # 计划成交名义额(正=买,负=卖)
@@ -236,7 +241,9 @@ def policy_from_config(config: dict) -> PolicyConfig | None:
 
 
 def decide(scores: dict, held: dict, prices: dict, states: dict,
-           total_value: float, cfg: PolicyConfig, asof=None):
+           total_value: float, cfg: PolicyConfig, asof=None, *,
+           max_total_pct_override: float | None = None,
+           entry_allowed: bool = True):
     """分数 → (目标权重, 冻结名单, 动作意图, 未动作原因, 当前权重)。
 
     Args:
@@ -246,6 +253,12 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
         states: {symbol: NameState};就地修改两处 —— 减仓价到期解除、存量持仓补基线
         total_value: 本次评估时点的总资产(现金 + 持仓市值)
         asof: 评估日(date / ISO 字符串 / Timestamp),用于减仓价有效期
+        max_total_pct_override: 组合级暴露层(`utils/exposure.py`)给出的本轮总仓位
+                上限,None = 用 cfg.max_total_pct。它只在本轮生效,所以**不走
+                validate()** —— 用低上限去套 max_names 会把一次性降杠杆判成
+                "参数矛盾",而实际要的是"这一轮进不去那么多"。
+        entry_allowed: False = 本轮不许开新仓也不许补仓(门控触发)。已挂的减仓/
+                清仓不受影响,那是在降风险。
 
     Returns:
         weights: {symbol: 目标权重};0.0 = 清仓;**缺席 = 本轮不碰**(缺价/缺分数)
@@ -260,6 +273,9 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
     notes: dict[str, str] = {}
 
     tv = float(total_value)
+    # 暴露层只允许**往下**调上限:写反了也不会因为低波动而自动加杠杆
+    cap = (cfg.max_total_pct if max_total_pct_override is None
+           else min(float(max_total_pct_override), cfg.max_total_pct))
     px = {str(s): float(p) for s, p in (prices or {}).items()
           if _finite(p) and float(p) > 0}
     sc = {str(s): float(v) for s, v in (scores or {}).items() if _finite(v)}
@@ -388,18 +404,50 @@ def decide(scores: dict, held: dict, prices: dict, states: dict,
             weights[s] = w0          # 带内:不补不减,按现价原样持有
             keep.add(s)
 
-    gross = _apply_budget(weights, keep, intents, notes, cur, entries, cfg, tv)
+    # ---------------- 组合级降杠杆 ----------------
+    # 上限被暴露层压低时,"减半"必须真的卖出去。分数带自己不会降总仓位:
+    # 分数还在买入线之上的名字会永远留在带内,所以只在权重上让名额是不够的。
+    # 按**当前**权重等比缩,保住分数带决定的相对结构。
+    cur_gross = sum(cur.values())
+    allow_new = entry_allowed and cur_gross <= cap + _EPS
+    if cap < cur_gross - _EPS:
+        k = cap / cur_gross
+        for s in sorted(cur, key=lambda x: (-cur[x], x)):
+            if s in intents or weights.get(s, cur[s]) <= 0:
+                continue            # 已挂减仓/清仓意图的由它自己释放预算
+            w0 = cur[s]
+            tgt = w0 * k
+            cut = (w0 - tgt) * tv
+            if cut < cfg.min_trade_value:
+                weights[s] = w0
+                keep.add(s)
+                notes[s] = (f"总仓位上限 {cap:.1%},降杠杆只需卖 {cut:,.0f} 元 "
+                            f"< 最小交易额 {cfg.min_trade_value:,.0f},不动")
+                continue
+            weights[s] = tgt
+            # 带内持有的名字本来在 keep 里(锁住不动),降杠杆要卖它就必须先解锁,
+            # 否则 rebalance_plan 会把目标锁回当前股数,这轮降杠杆静默失效。
+            keep.discard(s)
+            intents[s] = Intent("de_gross", s, tgt, -cut,
+                                state=(states or {}).get(s))
+
+    _apply_budget(weights, keep, intents, notes, cur, entries, cfg, tv,
+                  cap, allow_new)
     return weights, frozenset(keep), intents, notes, cur
 
 
 def _apply_budget(weights, keep, intents, notes, cur, entries,
-                  cfg: PolicyConfig, tv: float) -> float:
+                  cfg: PolicyConfig, tv: float, cap: float,
+                  allow_new: bool = True) -> float:
     """组合层约束:总仓位上限、补仓预留额度、股票数上限。
 
     优先级是**已有持仓的风险动作 > 补仓 > 新仓**,同层按分数降序。超预算时先把
     目标压到剩余额度;压完仍不足最小交易额就整个作废(状态不推进,下轮预算宽了
     自动重试)。不做"人人等比缩一档",那会让每笔单子刚好卡在最小交易额附近,
     最小佣金占比最难控。
+
+    cap 是**本轮生效**的总仓位上限(暴露层可能把它压到 cfg.max_total_pct 之下)。
+    allow_new=False 时补仓与新仓一并挂起:降杠杆那一轮把钱再花出去等于没降。
     """
     # 基线用"动作前的权重":补仓/建仓要挤进预算,减仓与清仓则释放预算。
     # 直接对 weights 求和会把补仓自己的目标也算进基线,于是永远"总仓位已满"。
@@ -413,11 +461,19 @@ def _apply_budget(weights, keep, intents, notes, cur, entries,
     # 新花钱的部分按含费口径占用预算(已有持仓的成本已经付过了,按 1:1 计)
     mult = 1.0 + cfg.fee_rate_buy
 
+    if not allow_new:
+        for s in [k for k, i in intents.items() if i.kind == "add"]:
+            _void(weights, keep, intents, notes, s, cur,
+                  "本轮不新增仓位(暴露层:降杠杆或 IC 门控),取消补仓")
+        for _, s, _ in entries:
+            notes[s] = "本轮不新增仓位(暴露层:降杠杆或 IC 门控),新仓挂起"
+        return gross
+
     for s in sorted([s for s, i in intents.items() if i.kind == "add"],
                     key=lambda k: (-intents[k].score, k)):
         it = intents[s]
         w0 = cur.get(s, 0.0)
-        room = (cfg.max_total_pct - gross) / mult
+        room = (cap - gross) / mult
         if room <= _EPS:
             _void(weights, keep, intents, notes, s, cur, "总仓位已满,取消补仓")
             continue
@@ -434,8 +490,7 @@ def _apply_budget(weights, keep, intents, notes, cur, entries,
     n_held = len([s for s in cur if weights.get(s, 0.0) > 0])
     # 新仓的额度既要扣掉补仓预留,更要扣掉**已经建好的仓位** —— 只在当轮内累加
     # used_new 会让每一轮都重新"满仓建仓",几轮下来总仓位就冲过上限了。
-    entry_cap = min(cfg.max_total_pct - cfg.add_reserve_weight,
-                    cfg.max_total_pct - gross)
+    entry_cap = min(cap - cfg.add_reserve_weight, cap - gross)
     used_new = 0.0
     for x, s, w in sorted(entries, key=lambda t: (-t[0], t[1])):
         if used_new + w * mult > entry_cap + _EPS:
@@ -472,11 +527,21 @@ def _void(weights, keep, intents, notes, s, cur, why):
 
 def plan(scores: dict, held: dict, prices: dict, states: dict,
          total_value: float, cfg: PolicyConfig, *,
-         lot_size: int = 100, asof=None) -> PolicyPlan:
-    """策略 → 可执行 Plan。回测引擎与实盘指令构造都走这一个函数。"""
+         lot_size: int = 100, asof=None,
+         max_total_pct_override: float | None = None,
+         entry_allowed: bool = True) -> PolicyPlan:
+    """策略 → 可执行 Plan。回测引擎与实盘指令构造都走这一个函数。
+
+    max_total_pct_override / entry_allowed 是组合级暴露层(utils/exposure.py)
+    的输入,不传就是纯分数带口径(与旧的已发布数字一致)。
+    """
     weights, keep_frozen, intents, notes, cur = decide(
-        scores, held, prices, states, total_value, cfg, asof=asof)
+        scores, held, prices, states, total_value, cfg, asof=asof,
+        max_total_pct_override=max_total_pct_override,
+        entry_allowed=entry_allowed)
     keep = set(keep_frozen)
+    cap = (cfg.max_total_pct if max_total_pct_override is None
+           else min(float(max_total_pct_override), cfg.max_total_pct))
 
     # 预算已按权重在 _apply_budget 里算完,这里不再二次裁剪(normalize=False)
     rp = rebalance_plan(weights, held, prices, total_value, lot_size=lot_size,
@@ -502,9 +567,9 @@ def plan(scores: dict, held: dict, prices: dict, states: dict,
     for it in intents.values():
         actions[it.kind] = actions.get(it.kind, 0) + 1
     gross = sum(weights.values())
-    if gross > cfg.max_total_pct + 1e-6:
-        logger.debug(f"策略目标总仓位 {gross:.1%} 超过 max_total_pct "
-                     f"{cfg.max_total_pct:.0%}(含缺价持仓,无法计量)")
+    if gross > cap + 1e-6:
+        logger.debug(f"策略目标总仓位 {gross:.1%} 超过本轮上限 {cap:.0%}"
+                     f"(含缺价持仓或降杠杆单被最小交易额砍掉,无法计量)")
     return PolicyPlan(plan=rp, weights=weights, keep=frozenset(keep),
                       intents=intents, notes=notes, actions=actions,
                       gross_weight=gross)
@@ -578,10 +643,13 @@ def apply_fills(states: dict, intents: dict, before: dict, after: dict,
             out[s] = (f"建仓提交 {d} 股(步长 Δ={it.state.step:.4f})"
                       if it.kind == "entry"
                       else f"补仓提交 +{d} 股,参考分数→{it.state.ref_score:.4f}")
-        elif it.kind in ("trim", "cap", "exit_by_trim") and want > 0 and -d >= want:
+        elif it.kind in ("trim", "cap", "exit_by_trim",
+                         "de_gross") and want > 0 and -d >= want:
             price = fp.get(s)
-            if it.kind == "cap":
-                out[s] = f"压上限提交 -{d} 股(价格漂移的风险动作,不设减仓价约束)"
+            if it.kind in ("cap", "de_gross"):
+                out[s] = (f"{'压上限' if it.kind == 'cap' else '降杠杆'}提交 "
+                          f"-{d} 股(组合级/价格的风险动作,不改分数状态、"
+                          f"不设减仓价约束)")
             elif price is None:
                 out[s] = f"减仓提交 -{d} 股,但缺成交价,减仓价约束未设置"
             else:

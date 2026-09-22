@@ -125,13 +125,17 @@ def plan_orders(scores: dict[str, float],
                 policy,
                 *,
                 lot_size: int = 100,
-                asof=None):
+                asof=None,
+                max_total_pct_override: float | None = None,
+                entry_allowed: bool = True):
     """分数带位策略版指令构造(与回测引擎走同一个 utils.position_policy.plan)。
 
     Args:
         scores: {symbol: 分数},**全截面**(低于建仓线的候选也要在里面)
         states: {symbol: NameState} 就地不变;成交回报后由 apply_fills 推进
         policy: utils.position_policy.PolicyConfig
+        max_total_pct_override / entry_allowed: 组合级暴露层(utils/exposure.py)
+                的结果,与回测引擎同一口径;不传 = 纯分数带
 
     Returns:
         (orders, PolicyPlan) —— 撮合回报到手后调用
@@ -141,14 +145,19 @@ def plan_orders(scores: dict[str, float],
     positions, held, prices, mv = _position_maps(positions, ref_price)
     total_value = cash + mv
     pol = policy_plan(scores or {}, held, prices, states, total_value,
-                      policy, lot_size=lot_size, asof=asof)
+                      policy, lot_size=lot_size, asof=asof,
+                      max_total_pct_override=max_total_pct_override,
+                      entry_allowed=entry_allowed)
     orders = _to_requests(pol.plan, positions, held, prices, cash, lot_size,
                           policy.fee_rate_buy, pol.intents)
     n_names = len([w for w in pol.weights.values() if w > 0])
+    cap = (policy.max_total_pct if max_total_pct_override is None
+           else min(float(max_total_pct_override), policy.max_total_pct))
     logger.info(
         f"策略指令: {sum(1 for o in orders if o.side == 'sell')} 卖 + "
         f"{sum(1 for o in orders if o.side == 'buy')} 买,动作 {pol.actions or '无'},"
-        f" 目标 {n_names} 只 / 仓位 {pol.gross_weight:.1%},"
+        f" 目标 {n_names} 只 / 仓位 {pol.gross_weight:.1%}(本轮上限 {cap:.1%}"
+        f"{'' if entry_allowed else ',禁新仓'}),"
         f" 总资产 {total_value:,.0f}")
     return orders, pol
 
